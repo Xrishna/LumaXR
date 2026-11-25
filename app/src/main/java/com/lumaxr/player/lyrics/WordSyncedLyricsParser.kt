@@ -159,15 +159,20 @@ object WordSyncedLyricsParser {
                         when (top?.role) {
                             "x-translation" -> translationBuf.append(txt)
                             "x-roman" -> romanBuf.append(txt)
-                            "x-bg" -> if (txt.isNotBlank() || currentBgWords.isNotEmpty()) {
+                            "x-bg" -> if (txt.isNotBlank()) {
                                 val st = top.startMs
                                 val en = top.endMs.coerceAtLeast(st + 50L)
                                 currentBgWords += LyricWord(txt, st, en)
                             }
-                            else -> if (txt.isNotBlank() || currentWords.isNotEmpty()) {
+                            else -> if (txt.isNotBlank()) {
                                 val st = top?.startMs ?: pStartMs
                                 val en = (top?.endMs ?: pEndMs).coerceAtLeast(st + 60L)
                                 currentWords += LyricWord(txt, st, en)
+                            } else if (top == null && !txt.contains('\n') && currentWords.isNotEmpty()) {
+                                val last = currentWords.last()
+                                if (!last.text.endsWith(" ")) {
+                                    currentWords[currentWords.lastIndex] = last.copy(text = last.text + " ")
+                                }
                             }
                         }
                     }
