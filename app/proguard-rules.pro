@@ -22,6 +22,9 @@
 -dontwarn org.bouncycastle.**
 -dontwarn javax.naming.**
 -dontwarn java.lang.management.**
+-dontwarn javax.el.**
+-dontwarn org.ietf.jgss.**
+-dontwarn net.engio.mbassy.**
 
 # Sardine WebDAV / SimpleXML
 -keep class com.thegrizzlylabs.sardineandroid.** { *; }
