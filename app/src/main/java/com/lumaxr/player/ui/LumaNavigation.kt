@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyListState
@@ -26,6 +27,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -82,18 +84,42 @@ fun isListOriginVisible(listState: LazyListState, key: Any): Boolean {
 @Composable
 fun LumaNavigationRoot(
     viewModel: MainViewModel,
-    initialVideoUri: String? = null,
+    externalVideoUri: String? = null,
 ) {
     val backStack = remember {
         mutableStateListOf<LumaRoute>(
-            if (initialVideoUri != null) LumaRoute.VideoPlayer(initialVideoUri, initialVideoUri.substringAfterLast('/'))
-            else LumaRoute.VideoLibrary,
+            if (!externalVideoUri.isNullOrBlank()) {
+                LumaRoute.VideoPlayer(
+                    externalVideoUri,
+                    externalVideoUri.substringAfterLast('/').ifBlank { "External Video" },
+                )
+            } else {
+                LumaRoute.VideoLibrary
+            },
         )
+    }
+
+    LaunchedEffect(externalVideoUri) {
+        if (!externalVideoUri.isNullOrBlank()) {
+            val top = backStack.lastOrNull()
+            val alreadyOpen = top is LumaRoute.VideoPlayer && top.uri == externalVideoUri
+            if (!alreadyOpen) {
+                if (top is LumaRoute.VideoPlayer && backStack.size > 1) {
+                    backStack.removeAt(backStack.lastIndex)
+                }
+                backStack.add(
+                    LumaRoute.VideoPlayer(
+                        externalVideoUri,
+                        externalVideoUri.substringAfterLast('/').ifBlank { "External Video" },
+                    ),
+                )
+            }
+        }
     }
 
     val backStyle by viewModel.backStyle.collectAsState()
     val musicState by viewModel.container.musicCoordinator.state.collectAsState()
-    var sharedElementsVisible by remember { mutableStateOf(true) }
+    var isPredictiveDragging by remember { mutableStateOf(false) }
     val videoGridState = remember { LazyGridState() }
     val musicListState = remember { LazyListState() }
 
@@ -112,6 +138,9 @@ fun LumaNavigationRoot(
             NavDisplay(
                 backStack = backStack,
                 onBack = {
+                    if (backStack.lastOrNull() is LumaRoute.VideoPlayer) {
+                        viewModel.container.videoCoordinator.stopAndRestoreDisplay()
+                    }
                     if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
                 },
                 sharedTransitionScope = sharedScope,
@@ -125,7 +154,7 @@ fun LumaNavigationRoot(
                             viewModel = viewModel,
                             gridState = videoGridState,
                             sharedScope = sharedScope,
-                            sharedElementsVisible = sharedElementsVisible,
+                            sharedElementsVisible = !isPredictiveDragging,
                             onOpenVideo = { item ->
                                 backStack.add(LumaRoute.VideoPlayer(item.uri, item.title))
                             },
@@ -157,7 +186,7 @@ fun LumaNavigationRoot(
                             enabled = backStack.size > 1,
                             style = backStyle,
                             onSharedVisibilityChange = { vis ->
-                                sharedElementsVisible = vis && originVisible
+                                isPredictiveDragging = !vis
                             },
                             onBackCommitted = {
                                 viewModel.container.videoCoordinator.stopAndRestoreDisplay()
@@ -169,7 +198,7 @@ fun LumaNavigationRoot(
                                 title = route.title,
                                 viewModel = viewModel,
                                 sharedScope = sharedScope,
-                                sharedElementsVisible = sharedElementsVisible && originVisible,
+                                sharedElementsVisible = !isPredictiveDragging && originVisible,
                                 onExit = {
                                     viewModel.container.videoCoordinator.stopAndRestoreDisplay()
                                     if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
@@ -187,7 +216,7 @@ fun LumaNavigationRoot(
                         PredictiveBackContainer(
                             enabled = backStack.size > 1,
                             style = backStyle,
-                            onSharedVisibilityChange = { vis -> sharedElementsVisible = vis },
+                            onSharedVisibilityChange = { vis -> isPredictiveDragging = !vis },
                             onBackCommitted = {
                                 if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
                             },
@@ -196,7 +225,7 @@ fun LumaNavigationRoot(
                                 heroKey = route.heroKey,
                                 viewModel = viewModel,
                                 sharedScope = sharedScope,
-                                sharedElementsVisible = sharedElementsVisible,
+                                sharedElementsVisible = !isPredictiveDragging,
                                 onClose = {
                                     if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
                                 },
@@ -261,6 +290,7 @@ fun LumaNavigationRoot(
                 androidx.compose.foundation.layout.Column(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .navigationBarsPadding()
                         .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
@@ -268,7 +298,7 @@ fun LumaNavigationRoot(
                         MiniPlayerBar(
                             state = musicState,
                             sharedScope = sharedScope,
-                            sharedElementsVisible = sharedElementsVisible,
+                            sharedElementsVisible = !isPredictiveDragging,
                             onTogglePlayPause = { viewModel.container.musicCoordinator.togglePlayPause() },
                             onNext = { viewModel.container.musicCoordinator.nextTrack() },
                             onPrev = { viewModel.container.musicCoordinator.prevTrack() },
@@ -282,8 +312,10 @@ fun LumaNavigationRoot(
                         NavigationBarItem(
                             selected = topRoute == LumaRoute.VideoLibrary,
                             onClick = {
-                                backStack.clear()
-                                backStack.add(LumaRoute.VideoLibrary)
+                                if (topRoute != LumaRoute.VideoLibrary) {
+                                    backStack.clear()
+                                    backStack.add(LumaRoute.VideoLibrary)
+                                }
                             },
                             icon = { Icon(Icons.Default.Movie, contentDescription = "Video") },
                             label = { Text("Cinema") },
@@ -291,8 +323,10 @@ fun LumaNavigationRoot(
                         NavigationBarItem(
                             selected = topRoute == LumaRoute.MusicLibrary,
                             onClick = {
-                                backStack.clear()
-                                backStack.add(LumaRoute.MusicLibrary)
+                                if (topRoute != LumaRoute.MusicLibrary) {
+                                    backStack.clear()
+                                    backStack.add(LumaRoute.MusicLibrary)
+                                }
                             },
                             icon = { Icon(Icons.Default.LibraryMusic, contentDescription = "Music") },
                             label = { Text("Hi-Res Music") },
@@ -300,8 +334,10 @@ fun LumaNavigationRoot(
                         NavigationBarItem(
                             selected = topRoute == LumaRoute.SettingsAndNetwork,
                             onClick = {
-                                backStack.clear()
-                                backStack.add(LumaRoute.SettingsAndNetwork)
+                                if (topRoute != LumaRoute.SettingsAndNetwork) {
+                                    backStack.clear()
+                                    backStack.add(LumaRoute.SettingsAndNetwork)
+                                }
                             },
                             icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
                             label = { Text("Pro & Backup") },

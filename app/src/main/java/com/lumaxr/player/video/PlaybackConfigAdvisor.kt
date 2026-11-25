@@ -27,46 +27,38 @@ enum class HdrToysToneMapper(val id: Int, val label: String) {
 }
 
 data class MpvConfigPlan(
-    val gpuApi: String,                // "vulkan" or "opengl"
-    val gpuContext: String,            // "android"
-    val vo: String,                    // "gpu-next"
-    val hwdec: String,                 // "mediacodec-copy" or "no"
-    val targetPrim: String,            // "bt.709" or "display-p3"
-    val targetTrc: String,             // "srgb" or "pq"
-    val targetContrast: Int,           // 1200
-    val targetPeakNits: Int,           // 203..300
-    val targetColorspaceHint: String,  // "no" (default) or "yes" (HBM experimental)
-    val desiredHdrHeadroom: Float,     // 1.0f or <= min(2.25f, highestHdrSdrRatio)
-    val toneMapping: String,           // "spline", "bt.2446a", etc.
-    val hdrComputePeak: Boolean,       // true (disabled if hdr-toys overrides or DV conflict)
-    val hdrPeakPercentile: Double,     // 99.8
-    val hdrContrastRecovery: Double,   // 0.25..0.30
-    val scaler: String,                // "ewa_lanczossharp", "spline36", "bilinear"
-    val downscaler: String,            // "mitchell"
-    val cscale: String,                // "bilinear"
+    val gpuApi: String,
+    val gpuContext: String,
+    val vo: String,
+    val hwdec: String,
+    val targetPrim: String,
+    val targetTrc: String,
+    val targetContrast: Int,
+    val targetPeakNits: Int,
+    val targetColorspaceHint: String,
+    val desiredHdrHeadroom: Float,
+    val toneMapping: String,
+    val hdrComputePeak: Boolean,
+    val hdrPeakPercentile: Double,
+    val hdrContrastRecovery: Double,
+    val scaler: String,
+    val downscaler: String,
+    val cscale: String,
     val correctDownscaling: Boolean,
     val linearDownscaling: Boolean,
-    val sharpen: Float,                // 0f for 4K remux (zero grain destruction)
+    val sharpen: Float,
     val debandEnabled: Boolean,
     val debandIterations: Int,
     val debandThreshold: Int,
     val debandRange: Int,
     val debandGrain: Int,
-    val subHdrPeakNits: Int,           // 120..160
+    val subHdrPeakNits: Int,
     val hdrToysMapper: HdrToysToneMapper,
     val stripDolbyVisionFallback: Boolean,
     val is4kUhdRemuxProfile: Boolean,
     val hbmWarningMessage: String?,
 )
 
-/**
- * Source-adaptive Cinema Mastering XR advisor.
- * - 4K UHD Remux / High-Bitrate 10-bit (>= 2160p or > 20 Mbps): sharpen=0, deband=no (zero grain destruction),
- *   dscale=mitchell, spline / bt.2446a, hdr-compute-peak=yes, percentile=99.8, contrast-recovery=0.25-0.30.
- * - 720p/1080p Streaming, 8-bit, or Anime (< 1600p or < 12 Mbps): Auto-ON Smooth Gradation deband + ewa_lanczossharp.
- * - Clean HDR tone-mapping bypass on SDR streams.
- * - ThermalGovernor overrides step down scaler/deband before dropped frames become visible.
- */
 class PlaybackConfigAdvisor {
 
     fun buildConfigPlan(
@@ -84,16 +76,20 @@ class PlaybackConfigAdvisor {
         masteringPeakNits: Float = 1000f,
     ): MpvConfigPlan {
         val isHdr = media.hdrFormat != HdrFormat.SDR
-        val is4kRemux = (media.height >= 2160 || media.width >= 3840 || media.bitrateMbps > 20.0) &&
-            media.bitDepth >= 10
-        val isLowResOrAnime = !is4kRemux && (media.height < 1600 || media.bitrateMbps < 12.0 || media.bitDepth <= 8)
+        val is4k = media.height >= 2160 || media.width >= 3840
+        val is4kRemux = (is4k || media.bitrateMbps > 20.0) && media.bitDepth >= 10
+        val isLowResOrAnime = !is4k && !is4kRemux &&
+            (media.height < 1600 || (media.bitrateMbps in 0.1..12.0) || media.bitDepth <= 8)
 
-        val targetPeak = RuanBacklightSpline.computeAmbientTargetPeakNits(
-            estimatedDisplayNits = estimatedDisplayNits,
-            manualOverrideNits = manualTargetPeakNits,
-        )
+        val targetPeak = if (experimentalHbmHdrMode) {
+            RuanHardwareProfile.KNOT_HBM_NITS.toInt()
+        } else {
+            RuanBacklightSpline.computeAmbientTargetPeakNits(
+                estimatedDisplayNits = estimatedDisplayNits,
+                manualOverrideNits = manualTargetPeakNits,
+            )
+        }
 
-        // Thermal governor override steps down ewa_lanczossharp -> spline36 -> bilinear
         val desiredScaler = when {
             is4kRemux -> "spline36"
             isLowResOrAnime && preset != XrPreset.RAW_BYPASS -> "ewa_lanczossharp"
@@ -107,7 +103,7 @@ class PlaybackConfigAdvisor {
             thermalTier.allowDeband
 
         val sharpen = when {
-            is4kRemux -> 0.0f // Strictly preserve 35mm film grain
+            is4kRemux -> 0.0f
             isLowResOrAnime && preset == XrPreset.CINEMA_MASTERING_XR -> 0.08f
             else -> 0.0f
         }
@@ -118,12 +114,12 @@ class PlaybackConfigAdvisor {
             else -> "spline"
         }
 
-        // Note: hdr-toys shader pipeline disables conflicting built-in tone-mapping compute peak
         val useBuiltInComputePeak = isHdr && hdrToysMapper == HdrToysToneMapper.OFF &&
             media.hdrFormat != HdrFormat.DV_P5
 
+        val safeRatio = if (displayHighestHdrSdrRatio.isFinite()) displayHighestHdrSdrRatio.coerceAtLeast(1.0f) else 1.0f
         val hdrHeadroom = if (experimentalHbmHdrMode) {
-            min(RuanHardwareProfile.HIGHEST_HDR_SDR_RATIO, displayHighestHdrSdrRatio.coerceAtLeast(1.0f))
+            min(RuanHardwareProfile.HIGHEST_HDR_SDR_RATIO, safeRatio)
         } else {
             1.0f
         }

@@ -1,4 +1,4 @@
-import java.util.Properties
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
@@ -35,7 +35,6 @@ android {
             abiFilters += listOf("arm64-v8a")
         }
 
-        manifestPlaceholders["appId"] = dynamicAppId
         buildConfigField("String", "BUILD_APP_ID", "\"$dynamicAppId\"")
         buildConfigField("String", "TARGET_DEVICE_MODEL", "\"24074RPD2I\"")
         buildConfigField("String", "TARGET_DEVICE_CODENAME", "\"ruan_in\"")
@@ -49,8 +48,10 @@ android {
             if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
                 storeFile = file(keystorePath)
                 storePassword = System.getenv("LUMAXR_KEYSTORE_PASSWORD") ?: "lumaxr_ci"
-                keyAlias = System.getenv("LUMAXR_KEY_ALIAS") ?: "lumaxr"
-                keyPassword = System.getenv("LUMAXR_KEY_PASSWORD") ?: "lumaxr_ci"
+                keyAlias = System.getenv("LUMAXR_KEYSTORE_ALIAS") ?: "lumaxr"
+                keyPassword = System.getenv("LUMAXR_KEYSTORE_PASSWORD_KEY")
+                    ?: System.getenv("LUMAXR_KEY_PASSWORD")
+                    ?: "lumaxr_ci"
             }
         }
     }
@@ -78,15 +79,6 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-        jvmTarget = "17"
-        freeCompilerArgs += listOf(
-            "-opt-in=androidx.compose.animation.ExperimentalSharedTransitionApi",
-            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
-            "-opt-in=androidx.media3.common.util.UnstableApi",
-        )
     }
 
     buildFeatures {
@@ -118,9 +110,19 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+        freeCompilerArgs.addAll(
+            "-opt-in=androidx.compose.animation.ExperimentalSharedTransitionApi",
+            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
+            "-opt-in=androidx.media3.common.util.UnstableApi",
+        )
+    }
+}
+
 ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
-    arg("room.incremental", "true")
 }
 
 dependencies {
@@ -147,7 +149,6 @@ dependencies {
     implementation(libs.androidx.navigation3.ui)
     implementation(libs.androidx.navigationevent.compose)
 
-    // Phase A/C Video + Audio Engines
     implementation(libs.mpv.android.lib)
     implementation(libs.androidx.media3.exoplayer)
     implementation(libs.androidx.media3.exoplayer.dash)
@@ -157,21 +158,17 @@ dependencies {
     implementation(libs.androidx.media3.datasource.okhttp)
     implementation(libs.androidx.media3.common)
 
-    // Room
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
     ksp(libs.androidx.room.compiler)
 
-    // Glance Home Widget
     implementation(libs.androidx.glance.appwidget)
     implementation(libs.androidx.glance.material3)
 
-    // Async & Serialization
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.guava)
     implementation(libs.kotlinx.serialization.json)
 
-    // Network, SMB, WebDAV, Images
     implementation(libs.okhttp)
     implementation(libs.smbj)
     implementation(libs.bouncycastle.bcprov)
@@ -180,7 +177,6 @@ dependencies {
     }
     implementation(libs.coil.compose)
 
-    // Unit Tests
     testImplementation(libs.junit)
     testImplementation(libs.truth)
     testImplementation(libs.kotlinx.coroutines.test)

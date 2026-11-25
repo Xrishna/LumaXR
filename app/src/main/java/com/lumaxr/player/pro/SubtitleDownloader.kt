@@ -1,5 +1,6 @@
 package com.lumaxr.player.pro
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -13,6 +14,7 @@ import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 
 data class SubtitleSearchResult(
     val fileId: Long,
@@ -21,10 +23,6 @@ data class SubtitleSearchResult(
     val downloadCount: Int,
 )
 
-/**
- * OpenSubtitles REST API v1 Client with 64-bit OpenSubtitles moviehash computation,
- * JWT login caching, and rate-limit-safe download.
- */
 class SubtitleDownloader(
     private val client: OkHttpClient = OkHttpClient(),
 ) {
@@ -67,7 +65,7 @@ class SubtitleDownloader(
             raf.readFully(buf)
             hash += sumLongsLe(buf)
         }
-        return "%016x".format(hash)
+        return String.format(Locale.US, "%016x", hash)
     }
 
     private fun sumLongsLe(bytes: ByteArray): Long {
@@ -100,9 +98,9 @@ class SubtitleDownloader(
             .header("User-Agent", USER_AGENT)
             .build()
 
-        runCatching {
+        try {
             client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use emptyList()
+                if (!resp.isSuccessful) return@withContext emptyList()
                 val dto = json.decodeFromString<OsSearchResponse>(resp.body?.string().orEmpty())
                 dto.data.mapNotNull { item ->
                     val f = item.attributes.files.firstOrNull() ?: return@mapNotNull null
@@ -114,7 +112,11 @@ class SubtitleDownloader(
                     )
                 }
             }
-        }.getOrDefault(emptyList())
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            emptyList()
+        }
     }
 
     suspend fun downloadSubtitle(
@@ -124,6 +126,7 @@ class SubtitleDownloader(
         targetDir: File,
     ): File? = withContext(Dispatchers.IO) {
         if (apiKey.isBlank() || jwtToken.isBlank()) return@withContext null
+        targetDir.mkdirs()
         val body = """{"file_id":$fileId}""".toRequestBody("application/json".toMediaType())
         val req = Request.Builder()
             .url("$BASE_URL/download")
@@ -133,19 +136,29 @@ class SubtitleDownloader(
             .post(body)
             .build()
 
-        runCatching {
+        try {
             val dlInfo = client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use null
+                if (!resp.isSuccessful) return@withContext null
                 json.decodeFromString<OsDownloadResponse>(resp.body?.string().orEmpty())
-            } ?: return@withContext null
+            }
+            if (dlInfo.link.isBlank()) return@withContext null
+            val safeName = File(dlInfo.file_name.ifBlank { "downloaded.srt" }).name
+                .replace(Regex("""[^A-Za-z0-9._-]"""), "_")
+                .ifBlank { "downloaded.srt" }
+            val out = File(targetDir, safeName)
+            if (!out.canonicalPath.startsWith(targetDir.canonicalPath)) return@withContext null
 
             val subReq = Request.Builder().url(dlInfo.link).build()
             client.newCall(subReq).execute().use { subResp ->
-                if (!subResp.isSuccessful) return@use null
-                val out = File(targetDir, dlInfo.file_name.ifBlank { "downloaded.srt" })
-                out.writeBytes(subResp.body?.bytes() ?: return@use null)
+                if (!subResp.isSuccessful) return@withContext null
+                val stream = subResp.body?.byteStream() ?: return@withContext null
+                out.outputStream().use { fos -> stream.copyTo(fos) }
                 out
             }
-        }.getOrNull()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            null
+        }
     }
 }

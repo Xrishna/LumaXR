@@ -13,14 +13,8 @@ import android.graphics.drawable.Icon
 import android.util.Rational
 import androidx.core.content.ContextCompat
 import com.lumaxr.player.hardware.DisplayRefreshRateManager
+import com.lumaxr.player.hardware.RefreshRatePolicy
 
-/**
- * Android 16 Auto-Enter Picture-in-Picture 2.0 Manager:
- * - setAutoEnterEnabled(isPlaying) + setSeamlessResizeEnabled(true)
- * - Exact sourceRectHint + expanded 16:10 / video aspect ratio
- * - Custom RemoteActions (Seek -10s, Play/Pause, Seek +10s)
- * - Restores 120 Hz refresh rate cleanly when entering/exiting PiP
- */
 class PipController(
     private val activity: Activity,
     private val refreshRateManager: DisplayRefreshRateManager,
@@ -35,6 +29,10 @@ class PipController(
         const val CMD_FORWARD = 3
     }
 
+    private var isRegistered = false
+    private var lastVideoFps = 0.0
+    private var lastPolicy = RefreshRatePolicy.AUTO_CINEMA_120HZ
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != ACTION_PIP_CONTROL) return
@@ -47,16 +45,20 @@ class PipController(
     }
 
     fun register() {
+        if (isRegistered) return
         ContextCompat.registerReceiver(
             activity,
             receiver,
             IntentFilter(ACTION_PIP_CONTROL),
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
+        isRegistered = true
     }
 
     fun unregister() {
+        if (!isRegistered) return
         runCatching { activity.unregisterReceiver(receiver) }
+        isRegistered = false
     }
 
     fun updateAutoPipParams(
@@ -64,7 +66,12 @@ class PipController(
         videoWidth: Int,
         videoHeight: Int,
         sourceRect: Rect?,
+        videoFps: Double = lastVideoFps,
+        policy: RefreshRatePolicy = lastPolicy,
     ) {
+        lastVideoFps = videoFps
+        lastPolicy = policy
+
         val ratio = if (videoWidth > 0 && videoHeight > 0) {
             Rational(videoWidth, videoHeight).let { r ->
                 val f = r.toFloat()
@@ -86,7 +93,6 @@ class PipController(
 
         val builder = PictureInPictureParams.Builder()
             .setAspectRatio(ratio)
-            .setExpandedAspectRatio(ratio)
             .setAutoEnterEnabled(isPlayingVideo)
             .setSeamlessResizeEnabled(true)
             .setActions(actions)
@@ -99,6 +105,8 @@ class PipController(
     fun onPipModeChanged(isInPip: Boolean) {
         if (isInPip) {
             refreshRateManager.restore120Hz(activity)
+        } else if (lastVideoFps > 0.0) {
+            refreshRateManager.applyToWindow(activity, lastVideoFps, lastPolicy)
         }
     }
 

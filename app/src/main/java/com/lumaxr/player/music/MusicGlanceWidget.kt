@@ -1,13 +1,16 @@
 package com.lumaxr.player.music
 
 import android.content.Context
-import android.content.Intent
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.glance.GlanceId
 import androidx.glance.GlanceModifier
 import androidx.glance.action.ActionParameters
+import androidx.glance.action.actionStartActivity
+import androidx.glance.action.clickable
 import androidx.glance.appwidget.GlanceAppWidget
 import androidx.glance.appwidget.GlanceAppWidgetReceiver
 import androidx.glance.appwidget.action.ActionCallback
@@ -28,6 +31,9 @@ import androidx.glance.text.Text
 import androidx.glance.text.TextStyle
 import androidx.glance.unit.ColorProvider
 import com.lumaxr.player.LumaXrApplication
+import com.lumaxr.player.MainActivity
+import kotlinx.coroutines.delay
+import java.util.Locale
 
 class MusicGlanceWidgetReceiver : GlanceAppWidgetReceiver() {
     override val glanceAppWidget: GlanceAppWidget = MusicGlanceWidget()
@@ -37,14 +43,17 @@ class MusicGlanceWidget : GlanceAppWidget() {
 
     override suspend fun provideGlance(context: Context, id: GlanceId) {
         val app = context.applicationContext as? LumaXrApplication
-        val state = app?.container?.musicCoordinator?.state?.value
-        val track = state?.currentTrack
+        val stateFlow = app?.container?.musicCoordinator?.state
 
         provideContent {
+            val state = stateFlow?.collectAsState()?.value
+            val track = state?.currentTrack
+
             Column(
                 modifier = GlanceModifier
                     .fillMaxSize()
                     .background(Color(0xFF0E131F))
+                    .clickable(actionStartActivity<MainActivity>())
                     .padding(14.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -59,7 +68,7 @@ class MusicGlanceWidget : GlanceAppWidget() {
                 )
                 Spacer(modifier = GlanceModifier.height(2.dp))
                 Text(
-                    text = if (track != null) "${track.artist} • ${track.codec.uppercase()}" else "Tap to play Hi-Res & Dolby",
+                    text = if (track != null) "${track.artist} • ${track.codec.uppercase(Locale.US)}" else "Tap to play Hi-Res & Dolby",
                     style = TextStyle(
                         color = ColorProvider(Color(0xFF94A3B8)),
                         fontSize = 12.sp,
@@ -77,7 +86,8 @@ class MusicGlanceWidget : GlanceAppWidget() {
                         style = TextStyle(color = ColorProvider(Color(0xFF7DD3FC)), fontSize = 13.sp, fontWeight = FontWeight.Medium),
                         modifier = GlanceModifier
                             .padding(horizontal = 10.dp, vertical = 6.dp)
-                            .background(Color(0xFF1E293B)),
+                            .background(Color(0xFF1E293B))
+                            .clickable(actionRunCallback<GlancePrevAction>()),
                     )
                     Spacer(modifier = GlanceModifier.width(8.dp))
                     Text(
@@ -85,7 +95,8 @@ class MusicGlanceWidget : GlanceAppWidget() {
                         style = TextStyle(color = ColorProvider(Color.Black), fontSize = 13.sp, fontWeight = FontWeight.Bold),
                         modifier = GlanceModifier
                             .padding(horizontal = 14.dp, vertical = 6.dp)
-                            .background(Color(0xFF38BDF8)),
+                            .background(Color(0xFF38BDF8))
+                            .clickable(actionRunCallback<GlancePlayPauseAction>()),
                     )
                     Spacer(modifier = GlanceModifier.width(8.dp))
                     Text(
@@ -93,7 +104,8 @@ class MusicGlanceWidget : GlanceAppWidget() {
                         style = TextStyle(color = ColorProvider(Color(0xFF7DD3FC)), fontSize = 13.sp, fontWeight = FontWeight.Medium),
                         modifier = GlanceModifier
                             .padding(horizontal = 10.dp, vertical = 6.dp)
-                            .background(Color(0xFF1E293B)),
+                            .background(Color(0xFF1E293B))
+                            .clickable(actionRunCallback<GlanceNextAction>()),
                     )
                 }
             }
@@ -105,6 +117,25 @@ class GlancePlayPauseAction : ActionCallback {
     override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
         val app = context.applicationContext as? LumaXrApplication
         app?.container?.musicCoordinator?.togglePlayPause()
+        delay(80L)
+        MusicGlanceWidget().update(context, glanceId)
+    }
+}
+
+class GlancePrevAction : ActionCallback {
+    override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
+        val app = context.applicationContext as? LumaXrApplication
+        app?.container?.musicCoordinator?.prevTrack()
+        delay(80L)
+        MusicGlanceWidget().update(context, glanceId)
+    }
+}
+
+class GlanceNextAction : ActionCallback {
+    override suspend fun onAction(context: Context, glanceId: GlanceId, parameters: ActionParameters) {
+        val app = context.applicationContext as? LumaXrApplication
+        app?.container?.musicCoordinator?.nextTrack()
+        delay(80L)
         MusicGlanceWidget().update(context, glanceId)
     }
 }

@@ -3,12 +3,14 @@ package com.lumaxr.player.video
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.KeyboardShortcutGroup
 import android.view.KeyboardShortcutInfo
-import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isAltPressed
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isMetaPressed
 import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerIcon
@@ -32,19 +34,19 @@ data class DesktopShortcutCallbacks(
     val onOpenContextMenu: () -> Unit = {},
 )
 
-/**
- * True Mouse, Trackpad & Keyboard Desktop Controls for tablet keyboard covers & external mice.
- */
 object DesktopInputHandler {
 
-    @OptIn(ExperimentalComposeUiApi::class)
     fun Modifier.lumaDesktopShortcuts(callbacks: DesktopShortcutCallbacks): Modifier =
-        this.onPreviewKeyEvent { event ->
-            if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+        this.onKeyEvent { event ->
+            if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+            if (event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return@onKeyEvent false
             when (event.key) {
                 Key.Spacebar -> { callbacks.onTogglePlayPause(); true }
                 Key.DirectionLeft -> { callbacks.onSeekRelativeSec(-10.0); true }
                 Key.DirectionRight -> { callbacks.onSeekRelativeSec(10.0); true }
+                Key.DirectionUp -> { callbacks.onAdjustVolumeDelta(0.05f); true }
+                Key.DirectionDown -> { callbacks.onAdjustVolumeDelta(-0.05f); true }
+                Key.Menu -> { callbacks.onOpenContextMenu(); true }
                 Key.I -> { callbacks.onToggleTelemetryPill(); true }
                 Key.D -> { callbacks.onToggleDeband(); true }
                 Key.T -> { callbacks.onCycleToneMap(); true }
@@ -63,13 +65,14 @@ object DesktopInputHandler {
         onSecondaryContextMenu: () -> Unit,
     ): Modifier = this
         .pointerHoverIcon(PointerIcon.Default)
-        .pointerInput(Unit) {
+        .pointerInput(onScrollSeekOrVolume, onSecondaryContextMenu) {
             awaitPointerEventScope {
                 while (true) {
                     val event = awaitPointerEvent()
                     when (event.type) {
                         PointerEventType.Press -> {
                             if (event.buttons.isSecondaryPressed) {
+                                event.changes.forEach { it.consume() }
                                 onSecondaryContextMenu()
                             }
                         }
@@ -77,6 +80,7 @@ object DesktopInputHandler {
                             val change = event.changes.firstOrNull() ?: continue
                             val dy = change.scrollDelta.y
                             if (dy != 0f) {
+                                change.consume()
                                 val isRight = change.position.x > (size.width * 0.5f)
                                 onScrollSeekOrVolume(dy, isRight)
                             }
@@ -93,7 +97,8 @@ object DesktopInputHandler {
                 "LumaXR Video & Cinema",
                 listOf(
                     KeyboardShortcutInfo("Play / Pause", AndroidKeyEvent.KEYCODE_SPACE, 0),
-                    KeyboardShortcutInfo("Seek -10s / +10s", AndroidKeyEvent.KEYCODE_DPAD_RIGHT, 0),
+                    KeyboardShortcutInfo("Seek -10s / +10s", AndroidKeyEvent.KEYCODE_DPAD_LEFT, 0),
+                    KeyboardShortcutInfo("Seek +10s", AndroidKeyEvent.KEYCODE_DPAD_RIGHT, 0),
                     KeyboardShortcutInfo("Toggle M3 Telemetry Pill", AndroidKeyEvent.KEYCODE_I, 0),
                     KeyboardShortcutInfo("Toggle Deband", AndroidKeyEvent.KEYCODE_D, 0),
                     KeyboardShortcutInfo("Cycle Tone-Map", AndroidKeyEvent.KEYCODE_T, 0),
@@ -103,7 +108,8 @@ object DesktopInputHandler {
             KeyboardShortcutGroup(
                 "LumaXR Audiophile Music",
                 listOf(
-                    KeyboardShortcutInfo("Next / Previous Track", AndroidKeyEvent.KEYCODE_N, 0),
+                    KeyboardShortcutInfo("Next Track", AndroidKeyEvent.KEYCODE_N, 0),
+                    KeyboardShortcutInfo("Previous Track", AndroidKeyEvent.KEYCODE_P, 0),
                     KeyboardShortcutInfo("Toggle Lyrics Studio", AndroidKeyEvent.KEYCODE_L, 0),
                     KeyboardShortcutInfo("Toggle Parametric EQ", AndroidKeyEvent.KEYCODE_E, 0),
                     KeyboardShortcutInfo("Mute / Unmute", AndroidKeyEvent.KEYCODE_M, 0),

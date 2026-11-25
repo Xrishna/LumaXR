@@ -6,19 +6,15 @@ import com.lumaxr.player.visuals.GlowType
 
 data class LyricStyleConfig(
     val glowType: GlowType = GlowType.SOFT_BLOOM,
-    val glowIntensity: Float = 0.90f, // 0.0 .. 2.0
+    val glowIntensity: Float = 0.90f,
     val highlightColor: Color = Color.White,
     val fontSizeSp: Float = 28f,
     val lineSpacingDp: Float = 18f,
-    val inactiveBlurStrength: Float = 0.55f, // 0.0 .. 1.0
+    val inactiveBlurStrength: Float = 0.55f,
     val showTranslation: Boolean = true,
     val showRomanization: Boolean = true,
 )
 
-/**
- * Computes continuous Apple Music-style per-word horizontal gradient wipe brushes
- * and sustained held-note (> 700 ms) bloom intensity.
- */
 object LyricGlowModifier {
 
     fun wordProgress(word: LyricWord, clockMs: Long): Float {
@@ -32,9 +28,19 @@ object LyricGlowModifier {
         if (word.durationMs <= 700L || clockMs < word.startMs || clockMs > word.endMs + 250L) {
             return 0f
         }
-        val p = wordProgress(word, clockMs)
-        val wave = kotlin.math.sin(p * kotlin.math.PI).toFloat().coerceIn(0f, 1f)
-        return wave * style.glowIntensity.coerceIn(0f, 2f)
+        val envelope = if (clockMs <= word.endMs) {
+            val p = wordProgress(word, clockMs)
+            kotlin.math.sin(p * kotlin.math.PI).toFloat().coerceIn(0.25f, 1f)
+        } else {
+            val tailFrac = ((clockMs - word.endMs).toFloat() / 250f).coerceIn(0f, 1f)
+            (1f - tailFrac) * 0.35f
+        }
+        val typeBoost = when (style.glowType) {
+            GlowType.NEON_CORE -> 1.35f
+            GlowType.CRISP_RIM -> 1.15f
+            else -> 1.0f
+        }
+        return envelope * style.glowIntensity.coerceIn(0f, 2f) * typeBoost
     }
 
     fun buildWordSweepBrush(

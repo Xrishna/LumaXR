@@ -5,10 +5,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.BufferedOutputStream
 import java.io.File
-import java.io.RandomAccessFile
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 interface RandomAccessByteSource {
@@ -17,11 +18,6 @@ interface RandomAccessByteSource {
     fun close() {}
 }
 
-/**
- * Sequential Range-Chunk Streaming Cache + Local 127.0.0.1 HTTP/1.1 206 Partial Content Proxy.
- * Prefetches sequential chunks (default 2 MiB chunks) to disk/RAM so 60-90 GB 4K UHD Remuxes
- * over SMB/WebDAV/HTTP seek cleanly inside libmpv without Transfer-Encoding: chunked stalls.
- */
 class RangeChunkCache(
     private val cacheRoot: File,
     private val scope: CoroutineScope,
@@ -29,8 +25,11 @@ class RangeChunkCache(
     val prefetchAheadChunks: Int = 3,
 ) {
     private val ramChunks = ConcurrentHashMap<String, ByteArray>()
+    private val chunkLocks = ConcurrentHashMap<String, Any>()
+    private val sourceLock = Any()
     private val maxRamChunks = 16
     private var serverSocket: ServerSocket? = null
+    private var activeSource: RandomAccessByteSource? = null
 
     init {
         cacheRoot.mkdirs()
@@ -42,7 +41,7 @@ class RangeChunkCache(
         offset: Long,
         length: Int,
     ): ByteArray {
-        if (offset >= source.totalLength || length <= 0) return ByteArray(0)
+        if (offset < 0L || offset >= source.totalLength || length <= 0) return ByteArray(0)
         val clampedLen = length.toLong().coerceAtMost(source.totalLength - offset).toInt()
         val out = ByteArray(clampedLen)
         var filled = 0
@@ -60,44 +59,61 @@ class RangeChunkCache(
         return if (filled == clampedLen) out else out.copyOf(filled)
     }
 
+    private fun chunkHashId(key: String, chunkIdx: Long): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest("$key#$chunkIdx".encodeToByteArray())
+        val hex = digest.take(12).joinToString("") { String.format(Locale.US, "%02x", it) }
+        return "${hex}_$chunkIdx"
+    }
+
     private fun loadOrFetchChunk(
         key: String,
         source: RandomAccessByteSource,
         chunkIdx: Long,
     ): ByteArray {
-        val cacheId = "${key.hashCode()}_$chunkIdx"
+        val cacheId = chunkHashId(key, chunkIdx)
         ramChunks[cacheId]?.let { return it }
 
-        val diskFile = File(cacheRoot, "$cacheId.bin")
-        if (diskFile.exists() && diskFile.length() > 0L) {
-            val bytes = diskFile.readBytes()
-            putRam(cacheId, bytes)
-            return bytes
-        }
+        val chunkLock = chunkLocks.computeIfAbsent(cacheId) { Any() }
+        synchronized(chunkLock) {
+            ramChunks[cacheId]?.let { return it }
 
-        val start = chunkIdx * chunkSizeBytes
-        if (start >= source.totalLength) return ByteArray(0)
-        val toRead = minOf(chunkSizeBytes.toLong(), source.totalLength - start).toInt()
-        val buf = ByteArray(toRead)
-        var totalRead = 0
-        while (totalRead < toRead) {
-            val n = source.readAt(start + totalRead, buf.copyOfRange(totalRead, toRead), toRead - totalRead)
-            if (n <= 0) break
-            totalRead += n
+            val diskFile = File(cacheRoot, "$cacheId.bin")
+            if (diskFile.exists() && diskFile.length() > 0L) {
+                val bytes = diskFile.readBytes()
+                putRam(cacheId, bytes)
+                return bytes
+            }
+
+            val start = chunkIdx * chunkSizeBytes
+            if (start >= source.totalLength) return ByteArray(0)
+            val toRead = minOf(chunkSizeBytes.toLong(), source.totalLength - start).toInt()
+            val outBuf = ByteArray(toRead)
+            val scratch = ByteArray(minOf(toRead, 256 * 1024))
+            var totalRead = 0
+            while (totalRead < toRead) {
+                val step = minOf(scratch.size, toRead - totalRead)
+                val n = synchronized(sourceLock) {
+                    source.readAt(start + totalRead, scratch, step)
+                }
+                if (n <= 0) break
+                val copied = n.coerceAtMost(step)
+                System.arraycopy(scratch, 0, outBuf, totalRead, copied)
+                totalRead += copied
+            }
+            val finalBuf = if (totalRead == toRead) outBuf else outBuf.copyOf(totalRead)
+            if (finalBuf.isNotEmpty()) {
+                runCatching {
+                    val tmp = File(cacheRoot, "$cacheId.tmp")
+                    tmp.writeBytes(finalBuf)
+                    if (!tmp.renameTo(diskFile)) {
+                        diskFile.writeBytes(finalBuf)
+                        tmp.delete()
+                    }
+                }
+                putRam(cacheId, finalBuf)
+            }
+            return finalBuf
         }
-        // Fallback if readAt wrote directly into passed buffer
-        val finalBuf = if (totalRead == 0) {
-            val direct = ByteArray(toRead)
-            val n = source.readAt(start, direct, toRead).coerceAtLeast(0)
-            direct.copyOf(n)
-        } else {
-            buf.copyOf(totalRead)
-        }
-        if (finalBuf.isNotEmpty()) {
-            runCatching { diskFile.writeBytes(finalBuf) }
-            putRam(cacheId, finalBuf)
-        }
-        return finalBuf
     }
 
     private fun triggerSequentialPrefetch(key: String, source: RandomAccessByteSource, currentChunkIdx: Long) {
@@ -106,7 +122,7 @@ class RangeChunkCache(
                 val idx = currentChunkIdx + ahead
                 val start = idx * chunkSizeBytes
                 if (start >= source.totalLength) break
-                val cacheId = "${key.hashCode()}_$idx"
+                val cacheId = chunkHashId(key, idx)
                 if (!ramChunks.containsKey(cacheId) && !File(cacheRoot, "$cacheId.bin").exists()) {
                     loadOrFetchChunk(key, source, idx)
                 }
@@ -121,11 +137,9 @@ class RangeChunkCache(
         ramChunks[id] = bytes
     }
 
-    /**
-     * Starts a local loopback HTTP/1.1 server returning strict 206 Partial Content for libmpv.
-     */
     fun startLoopbackProxy(key: String, source: RandomAccessByteSource): String {
         stopProxy()
+        activeSource = source
         val ss = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
         serverSocket = ss
         val port = ss.localPort
@@ -153,15 +167,35 @@ class RangeChunkCache(
             val total = source.totalLength
             var start = 0L
             var end = (total - 1).coerceAtLeast(0L)
+            var satisfiable = total > 0L
             val isPartial = rangeHeader != null && rangeHeader.startsWith("bytes=")
             if (isPartial) {
-                val spec = rangeHeader!!.substringAfter("bytes=").substringBefore(',')
+                val spec = rangeHeader!!.substringAfter("bytes=").substringBefore(',').trim()
                 val parts = spec.split('-')
-                start = parts.getOrNull(0)?.toLongOrNull() ?: 0L
-                end = parts.getOrNull(1)?.toLongOrNull()?.coerceAtMost(total - 1) ?: (total - 1)
+                val p0 = parts.getOrNull(0).orEmpty()
+                val p1 = parts.getOrNull(1).orEmpty()
+                if (p0.isEmpty() && p1.isNotEmpty()) {
+                    val suffix = p1.toLongOrNull() ?: 0L
+                    if (suffix <= 0L || total <= 0L) satisfiable = false
+                    else {
+                        start = (total - suffix).coerceAtLeast(0L)
+                        end = total - 1
+                    }
+                } else {
+                    start = p0.toLongOrNull() ?: 0L
+                    end = p1.toLongOrNull()?.coerceAtMost(total - 1) ?: (total - 1)
+                    if (start < 0L || start >= total || start > end) satisfiable = false
+                }
             }
-            val contentLen = (end - start + 1).coerceAtLeast(0L)
+
             val out = BufferedOutputStream(s.getOutputStream())
+            if (isPartial && !satisfiable) {
+                out.write("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$total\r\nConnection: close\r\n\r\n".encodeToByteArray())
+                out.flush()
+                return
+            }
+
+            val contentLen = if (total == 0L) 0L else (end - start + 1).coerceAtLeast(0L)
             val header = buildString {
                 if (isPartial) {
                     append("HTTP/1.1 206 Partial Content\r\n")
@@ -175,7 +209,7 @@ class RangeChunkCache(
                 append("Connection: close\r\n\r\n")
             }
             out.write(header.encodeToByteArray())
-            if (!reqLine.startsWith("HEAD")) {
+            if (!reqLine.startsWith("HEAD") && contentLen > 0L) {
                 var cursor = start
                 val step = 256 * 1024
                 while (cursor <= end) {
@@ -193,5 +227,7 @@ class RangeChunkCache(
     fun stopProxy() {
         runCatching { serverSocket?.close() }
         serverSocket = null
+        runCatching { activeSource?.close() }
+        activeSource = null
     }
 }

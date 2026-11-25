@@ -2,6 +2,8 @@ package com.lumaxr.player.music
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.Spatializer
@@ -23,20 +25,18 @@ data class SpatialAudioState(
             isAvailable && isEnabled
 }
 
-/**
- * Android 13-16 Official Spatializer API Manager.
- * Coordinates cleanly with Dolby Audio / bluetooth_device:dolby so SOFA HRTF binaural rendering
- * is offered ONLY when system Spatializer is unavailable or disabled (never double-virtualized).
- */
-class SpatialAudioManager(private val context: Context) {
+class SpatialAudioManager(context: Context) {
 
-    private val audioManager = context.getSystemService(AudioManager::class.java)
+    private val appContext = context.applicationContext
+    private val audioManager = appContext.getSystemService(AudioManager::class.java)
     private val spatializer: Spatializer? = audioManager?.spatializer
+    private val lock = Any()
 
     private val _state = MutableStateFlow(SpatialAudioState())
     val state: StateFlow<SpatialAudioState> = _state.asStateFlow()
 
-    private var userSofaHrtfRequested: Boolean = false
+    private var isStarted = false
+    private var userSofaHrtfRequested = false
 
     private val stateListener = object : Spatializer.OnSpatializerStateChangedListener {
         override fun onSpatializerEnabledChanged(spat: Spatializer, enabled: Boolean) = refresh()
@@ -45,34 +45,46 @@ class SpatialAudioManager(private val context: Context) {
 
     private val headTrackerListener = Spatializer.OnHeadTrackerAvailableListener { _, _ -> refresh() }
 
+    private val deviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = refresh()
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) = refresh()
+    }
+
     fun start() {
-        spatializer?.let { s ->
-            runCatching {
-                s.addOnSpatializerStateChangedListener(context.mainExecutor, stateListener)
-                s.addOnHeadTrackerAvailableListener(context.mainExecutor, headTrackerListener)
+        synchronized(lock) {
+            if (isStarted) return
+            isStarted = true
+            spatializer?.let { s ->
+                runCatching { s.addOnSpatializerStateChangedListener(appContext.mainExecutor, stateListener) }
+                runCatching { s.addOnHeadTrackerAvailableListener(appContext.mainExecutor, headTrackerListener) }
             }
+            runCatching { audioManager?.registerAudioDeviceCallback(deviceCallback, null) }
         }
         refresh()
     }
 
     fun stop() {
-        spatializer?.let { s ->
-            runCatching {
-                s.removeOnSpatializerStateChangedListener(stateListener)
-                s.removeOnHeadTrackerAvailableListener(headTrackerListener)
+        synchronized(lock) {
+            if (!isStarted) return
+            isStarted = false
+            spatializer?.let { s ->
+                runCatching { s.removeOnSpatializerStateChangedListener(stateListener) }
+                runCatching { s.removeOnHeadTrackerAvailableListener(headTrackerListener) }
             }
+            runCatching { audioManager?.unregisterAudioDeviceCallback(deviceCallback) }
         }
     }
 
     fun setSofaHrtfRequested(requested: Boolean) {
-        userSofaHrtfRequested = requested
+        synchronized(lock) { userSofaHrtfRequested = requested }
         refresh()
     }
 
     fun refresh() {
+        val wantSofa = synchronized(lock) { userSofaHrtfRequested }
         val s = spatializer
         if (s == null) {
-            _state.value = SpatialAudioState(sofaHrtfActive = userSofaHrtfRequested)
+            _state.value = SpatialAudioState(sofaHrtfActive = wantSofa)
             return
         }
         val attrs = AudioAttributes.Builder()
@@ -92,8 +104,7 @@ class SpatialAudioManager(private val context: Context) {
         val canMultichannel = runCatching { s.canBeSpatialized(attrs, format51) }.getOrDefault(false)
 
         val sysActive = level != Spatializer.SPATIALIZER_IMMERSIVE_LEVEL_NONE && avail && enabled
-        // Never double-virtualize: only engage SOFA HRTF if system spatializer is inactive
-        val sofaActive = userSofaHrtfRequested && !sysActive
+        val sofaActive = wantSofa && !sysActive
 
         _state.value = SpatialAudioState(
             immersiveLevel = level,
@@ -106,7 +117,10 @@ class SpatialAudioManager(private val context: Context) {
         )
     }
 
-    fun buildAudioAttributes(isPreRenderedBinaural: Boolean, bypassSystemSpatializer: Boolean): AudioAttributes {
+    fun buildAudioAttributes(
+        isPreRenderedBinaural: Boolean = _state.value.sofaHrtfActive,
+        bypassSystemSpatializer: Boolean = _state.value.sofaHrtfActive,
+    ): AudioAttributes {
         return AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)

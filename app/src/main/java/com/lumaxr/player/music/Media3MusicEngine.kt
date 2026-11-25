@@ -1,7 +1,6 @@
 package com.lumaxr.player.music
 
 import android.content.Context
-import android.media.AudioAttributes as PlatformAudioAttributes
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -11,6 +10,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionParameters.AudioOffloadPreferences
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import com.lumaxr.player.data.AudioTrackEntity
 import com.lumaxr.player.hardware.RuanHardwareProfile
@@ -30,31 +30,31 @@ data class Media3AudioState(
     val truePeakDbfs: Float = -1.2f,
 )
 
-/**
- * Engine 1 (Media3 1.11.1): ExoPlayer + Vendor Dolby HAL (c2.dolby.eac3.decoder / c2.dolby.ac4.decoder)
- * + Bit-Perfect USB Mixer + CTA-2075 LoudnessCodecController + Low-Power Audio Offload.
- */
 class Media3MusicEngine(
-    private val context: Context,
+    context: Context,
     private val codecSelector: DolbyAudioCodecSelector,
     private val dspController: AudioDspController,
     private val loudnessManager: LoudnessAndReplayGainManager,
     private val usbBitPerfectManager: UsbBitPerfectManager,
     private val spatialAudioManager: SpatialAudioManager,
 ) {
+    private val appContext = context.applicationContext
     private val _state = MutableStateFlow(Media3AudioState())
     val state: StateFlow<Media3AudioState> = _state.asStateFlow()
 
     val player: ExoPlayer
+    var onQueueIndexChanged: ((Int) -> Unit)? = null
+    private var lastTracks: List<AudioTrackEntity> = emptyList()
+    private var lastPreferBitPerfect = false
 
     init {
-        val renderersFactory = DefaultRenderersFactory(context)
+        val renderersFactory = DefaultRenderersFactory(appContext)
             .setEnableDecoderFallback(true)
             .setEnableAudioOutputPlaybackParameters(true)
             .setMediaCodecSelector(codecSelector)
 
-        val trackSelector = DefaultTrackSelector(context)
-        player = ExoPlayer.Builder(context, renderersFactory)
+        val trackSelector = DefaultTrackSelector(appContext)
+        player = ExoPlayer.Builder(appContext, renderersFactory)
             .setTrackSelector(trackSelector)
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -75,6 +75,13 @@ class Media3MusicEngine(
                 }
             }
 
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                val idx = player.currentMediaItemIndex
+                if (idx in lastTracks.indices) {
+                    onQueueIndexChanged?.invoke(idx)
+                }
+            }
+
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _state.value = _state.value.copy(
                     isPlaying = isPlaying,
@@ -82,7 +89,31 @@ class Media3MusicEngine(
                 )
                 if (!isPlaying) {
                     usbBitPerfectManager.clearBitPerfect()
+                } else if (lastPreferBitPerfect) {
+                    val track = lastTracks.getOrNull(player.currentMediaItemIndex)
+                    if (track != null) {
+                        val attrs = spatialAudioManager.buildAudioAttributes(false, true)
+                        val bp = usbBitPerfectManager.engageForTrack(attrs, track.sampleRateHz, track.bitDepth, true)
+                        dspController.setBitPerfectBypass(bp)
+                    }
                 }
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    _state.value = _state.value.copy(durationMs = player.duration.coerceAtLeast(0L))
+                }
+            }
+        })
+
+        player.addAnalyticsListener(object : AnalyticsListener {
+            override fun onAudioDecoderInitialized(
+                eventTime: AnalyticsListener.EventTime,
+                decoderName: String,
+                initializedTimestampMs: Long,
+                initializationDurationMs: Long,
+            ) {
+                _state.value = _state.value.copy(activeDecoderName = decoderName)
             }
         })
     }
@@ -94,6 +125,8 @@ class Media3MusicEngine(
         preferBitPerfectUsb: Boolean,
         screenOffOffloadAllowed: Boolean,
     ) {
+        lastTracks = tracks
+        lastPreferBitPerfect = preferBitPerfectUsb
         val items = tracks.map { t ->
             MediaItem.Builder()
                 .setMediaId(t.uri)
@@ -111,7 +144,7 @@ class Media3MusicEngine(
 
         val currentTrack = tracks.getOrNull(startIndex)
         val platformAttrs = spatialAudioManager.buildAudioAttributes(
-            isPreRenderedBinaural = false,
+            isPreRenderedBinaural = spatialAudioManager.state.value.sofaHrtfActive,
             bypassSystemSpatializer = preferBitPerfectUsb,
         )
         val bpActive = if (currentTrack != null && preferBitPerfectUsb) {

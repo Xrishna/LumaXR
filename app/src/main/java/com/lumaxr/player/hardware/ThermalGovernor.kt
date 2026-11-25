@@ -3,15 +3,17 @@ package com.lumaxr.player.hardware
 import android.content.Context
 import android.os.Build
 import android.os.PowerManager
+import android.os.SystemClock
 import android.os.health.GpuHeadroomParams
 import android.os.health.SystemHealthManager
+import androidx.annotation.RequiresApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 enum class ThermalTier(
     val scalerOverride: String?,
-    val bilateralRadius: Int, // 4 = 9-tap, 2 = 5-tap, 0 = off
+    val bilateralRadius: Int,
     val allowDeband: Boolean,
     val visualizerMaxFps: Int,
 ) {
@@ -32,45 +34,56 @@ data class GovernorSnapshot(
 
 /**
  * General Thermal, API 36 GPU Headroom & Frame-Drop Governor.
- * Monitors PowerManager.OnThermalStatusChangedListener (SKIN), API 36 SystemHealthManager.getGpuHeadroom(),
- * software dav1d AV1 decode (>1080p), and MPV vo-delayed-frame-count / frame-drop-count.
+ * Fixes android.util.Range<Int> (.lower/.upper), monotonic elapsedRealtime(), and synchronized state.
  */
-class ThermalGovernor(private val context: Context) {
+class ThermalGovernor(context: Context) {
 
-    private val powerManager = context.getSystemService(PowerManager::class.java)
+    private val appContext = context.applicationContext
+    private val powerManager = appContext.getSystemService(PowerManager::class.java)
     private val systemHealthManager: SystemHealthManager? =
-        context.getSystemService(SystemHealthManager::class.java)
+        appContext.getSystemService(SystemHealthManager::class.java)
 
+    private val lock = Any()
     private val _snapshot = MutableStateFlow(GovernorSnapshot())
     val snapshot: StateFlow<GovernorSnapshot> = _snapshot.asStateFlow()
 
+    private var isStarted = false
     private var lastGpuPollMs: Long = 0L
     private var gpuMinIntervalMs: Long = 1000L
     private var currentThermalStatus: Int = PowerManager.THERMAL_STATUS_NONE
     private var prevDelayedFrames: Long = 0L
     private var prevDroppedFrames: Long = 0L
+    private var pressureHoldUntilMs: Long = 0L
 
     private val thermalListener = PowerManager.OnThermalStatusChangedListener { status ->
-        currentThermalStatus = status
-        recomputeTier()
+        synchronized(lock) {
+            currentThermalStatus = status
+            recomputeTierLocked()
+        }
     }
 
     fun start() {
-        runCatching {
-            currentThermalStatus = powerManager?.currentThermalStatus ?: PowerManager.THERMAL_STATUS_NONE
-            powerManager?.addThermalStatusListener(context.mainExecutor, thermalListener)
-        }
-        if (Build.VERSION.SDK_INT >= 36 && systemHealthManager != null) {
+        synchronized(lock) {
+            if (isStarted) return
+            isStarted = true
             runCatching {
-                gpuMinIntervalMs = systemHealthManager.gpuHeadroomMinIntervalMillis.coerceAtLeast(500L)
+                currentThermalStatus = powerManager?.currentThermalStatus ?: PowerManager.THERMAL_STATUS_NONE
+                powerManager?.addThermalStatusListener(appContext.mainExecutor, thermalListener)
             }
+            if (Build.VERSION.SDK_INT >= 36 && systemHealthManager != null) {
+                runCatching {
+                    gpuMinIntervalMs = systemHealthManager.gpuHeadroomMinIntervalMillis.coerceAtLeast(500L)
+                }
+            }
+            recomputeTierLocked()
         }
-        recomputeTier()
     }
 
     fun stop() {
-        runCatching {
-            powerManager?.removeThermalStatusListener(thermalListener)
+        synchronized(lock) {
+            if (!isStarted) return
+            isStarted = false
+            runCatching { powerManager?.removeThermalStatusListener(thermalListener) }
         }
     }
 
@@ -79,36 +92,44 @@ class ThermalGovernor(private val context: Context) {
         droppedFrames: Long,
         isSoftwareAv1Over1080p: Boolean,
     ) {
-        val nowMs = System.currentTimeMillis()
-        var headroom: Float? = _snapshot.value.gpuHeadroomPercent
+        val nowMs = SystemClock.elapsedRealtime()
+        var headroom: Float?
+        val shouldPollGpu: Boolean
+        synchronized(lock) {
+            headroom = _snapshot.value.gpuHeadroomPercent
+            shouldPollGpu = Build.VERSION.SDK_INT >= 36 &&
+                systemHealthManager != null &&
+                nowMs - lastGpuPollMs >= gpuMinIntervalMs
+            if (shouldPollGpu) lastGpuPollMs = nowMs
+        }
 
-        if (Build.VERSION.SDK_INT >= 36 &&
-            systemHealthManager != null &&
-            nowMs - lastGpuPollMs >= gpuMinIntervalMs
-        ) {
-            lastGpuPollMs = nowMs
+        if (shouldPollGpu && Build.VERSION.SDK_INT >= 36 && systemHealthManager != null) {
             headroom = queryApi36GpuHeadroom(systemHealthManager)
         }
 
-        val delayedDelta = (delayedFrames - prevDelayedFrames).coerceAtLeast(0L)
-        val droppedDelta = (droppedFrames - prevDroppedFrames).coerceAtLeast(0L)
-        prevDelayedFrames = delayedFrames
-        prevDroppedFrames = droppedFrames
+        synchronized(lock) {
+            val delayedDelta = (delayedFrames - prevDelayedFrames).coerceAtLeast(0L)
+            val droppedDelta = (droppedFrames - prevDroppedFrames).coerceAtLeast(0L)
+            prevDelayedFrames = delayedFrames
+            prevDroppedFrames = droppedFrames
 
-        recomputeTier(
-            gpuHeadroom = headroom,
-            delayedFrames = delayedFrames,
-            droppedFrames = droppedFrames,
-            recentFramePressure = delayedDelta >= 4 || droppedDelta >= 2,
-            softwareAv1Active = isSoftwareAv1Over1080p,
-        )
+            if (delayedDelta >= 4 || droppedDelta >= 2) {
+                pressureHoldUntilMs = nowMs + 4000L
+            }
+            recomputeTierLocked(
+                gpuHeadroom = headroom,
+                delayedFrames = delayedFrames,
+                droppedFrames = droppedFrames,
+                softwareAv1Active = isSoftwareAv1Over1080p,
+            )
+        }
     }
 
+    @RequiresApi(36)
     private fun queryApi36GpuHeadroom(shm: SystemHealthManager): Float? {
-        if (Build.VERSION.SDK_INT < 36) return null
         return try {
             val range = shm.gpuHeadroomCalculationWindowRange
-            val windowMs = 2000.coerceIn(range.first, range.second)
+            val windowMs = 2000.coerceIn(range.lower, range.upper)
             val params = GpuHeadroomParams.Builder()
                 .setCalculationType(GpuHeadroomParams.GPU_HEADROOM_CALCULATION_TYPE_AVERAGE)
                 .setCalculationWindowMillis(windowMs)
@@ -122,13 +143,13 @@ class ThermalGovernor(private val context: Context) {
         }
     }
 
-    private fun recomputeTier(
+    private fun recomputeTierLocked(
         gpuHeadroom: Float? = _snapshot.value.gpuHeadroomPercent,
         delayedFrames: Long = _snapshot.value.delayedFrames,
         droppedFrames: Long = _snapshot.value.droppedFrames,
-        recentFramePressure: Boolean = false,
         softwareAv1Active: Boolean = _snapshot.value.softwareAv1Active,
     ) {
+        val recentFramePressure = SystemClock.elapsedRealtime() <= pressureHoldUntilMs
         val tier = when {
             currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE ||
                 (gpuHeadroom != null && gpuHeadroom < 10f) -> ThermalTier.CRITICAL

@@ -4,6 +4,8 @@ import com.lumaxr.player.data.AudioTrackEntity
 import com.lumaxr.player.data.ScrobbleQueueDao
 import com.lumaxr.player.data.ScrobbleQueueEntity
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -14,6 +16,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.TreeMap
 
 @Serializable
@@ -24,14 +27,12 @@ data class ScrobbleCredentials(
     val listenBrainzToken: String = "",
 )
 
-/**
- * Native Last.fm (AudioScrobbler 2.0) & ListenBrainz (/1/submit-listens) scrobbler with Room offline retry queue.
- */
 class ScrobbleManager(
     private val dao: ScrobbleQueueDao,
     private val client: OkHttpClient = OkHttpClient(),
 ) {
-    private val json = Json { encodeDefaults = true }
+    private val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
+    private val flushMutex = Mutex()
 
     @Volatile
     var credentials = ScrobbleCredentials()
@@ -50,27 +51,31 @@ class ScrobbleManager(
         flushPending()
     }
 
-    suspend fun flushPending() = withContext(Dispatchers.IO) {
-        val creds = credentials
-        if (creds.lastFmApiKey.isNotBlank() && creds.lastFmSessionKey.isNotBlank()) {
-            val batch = dao.pendingLastFm().take(50)
-            if (batch.isNotEmpty() && sendLastFmBatch(creds, batch)) {
-                dao.markLastFmSent(batch.map { it.id })
+    suspend fun flushPending() = flushMutex.withLock {
+        withContext(Dispatchers.IO) {
+            val creds = credentials
+            if (creds.lastFmApiKey.isNotBlank() &&
+                creds.lastFmSecret.isNotBlank() &&
+                creds.lastFmSessionKey.isNotBlank()
+            ) {
+                while (true) {
+                    val batch = dao.pendingLastFm().take(50)
+                    if (batch.isEmpty() || !sendLastFmBatch(creds, batch)) break
+                    dao.markLastFmSent(batch.map { it.id })
+                }
             }
-        }
-        if (creds.listenBrainzToken.isNotBlank()) {
-            val batch = dao.pendingListenBrainz().take(100)
-            if (batch.isNotEmpty() && sendListenBrainzBatch(creds.listenBrainzToken, batch)) {
-                dao.markListenBrainzSent(batch.map { it.id })
+            if (creds.listenBrainzToken.isNotBlank()) {
+                while (true) {
+                    val batch = dao.pendingListenBrainz().take(100)
+                    if (batch.isEmpty() || !sendListenBrainzBatch(creds.listenBrainzToken, batch)) break
+                    dao.markListenBrainzSent(batch.map { it.id })
+                }
             }
         }
     }
 
-    /**
-     * Builds strict ASCII-sorted Last.fm api_sig (excluding `format` and `callback`).
-     */
     fun buildLastFmApiSig(params: Map<String, String>, secret: String): String {
-        val sorted = TreeMap<String, String>(String.CASE_INSENSITIVE_ORDER.let { Comparator { a, b -> a.compareTo(b) } })
+        val sorted = TreeMap<String, String>()
         params.forEach { (k, v) ->
             if (k != "format" && k != "callback") sorted[k] = v
         }
@@ -79,8 +84,11 @@ class ScrobbleManager(
             append(secret)
         }
         val md = MessageDigest.getInstance("MD5").digest(raw.encodeToByteArray())
-        return md.joinToString("") { "%02x".format(it) }
+        return md.joinToString("") { String.format(Locale.US, "%02x", it) }
     }
+
+    @Serializable
+    private data class LastFmErrorCheck(val error: Int? = null)
 
     private fun sendLastFmBatch(creds: ScrobbleCredentials, items: List<ScrobbleQueueEntity>): Boolean {
         val params = mutableMapOf(
@@ -105,7 +113,14 @@ class ScrobbleManager(
             .url("https://ws.audioscrobbler.com/2.0/")
             .post(bodyBuilder.build())
             .build()
-        return runCatching { client.newCall(req).execute().use { it.isSuccessful } }.getOrDefault(false)
+        return runCatching {
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use false
+                val bodyStr = resp.body?.string().orEmpty()
+                val err = runCatching { json.decodeFromString<LastFmErrorCheck>(bodyStr) }.getOrNull()
+                err?.error == null
+            }
+        }.getOrDefault(false)
     }
 
     @Serializable

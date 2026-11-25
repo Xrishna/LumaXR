@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.ScrollableTabRow
@@ -25,6 +26,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -34,6 +36,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lumaxr.player.data.AudioTrackEntity
+import kotlinx.serialization.json.Json
+import java.util.Locale
 
 @Composable
 fun MusicLibraryScreen(
@@ -48,8 +52,14 @@ fun MusicLibraryScreen(
     val listeningEvents by viewModel.listeningEvents.collectAsState()
     val totalMs by viewModel.totalListenedMs.collectAsState()
 
+    val hiResListState = rememberLazyListState()
+    val albumsGroups = remember(allTracks) { allTracks.groupBy { it.album } }
+    val artistsGroups = remember(allTracks) { allTracks.groupBy { it.artist } }
+    val foldersGroups = remember(allTracks) { allTracks.groupBy { it.folderPath.substringAfterLast('/') } }
+    val tracksByUri = remember(allTracks) { allTracks.associateBy { it.uri } }
+
     val tabs = listOf("Tracks", "Albums", "Artists", "Folders", "Dolby & Hi-Res", "Playlists", "Insights")
-    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
 
     Column(
         modifier = Modifier
@@ -77,28 +87,47 @@ fun MusicLibraryScreen(
                 onPlayTracks(allTracks, idx)
                 onOpenNowPlaying()
             }
-            1 -> GroupedAudioPane(allTracks.groupBy { it.album }) { groupTracks ->
+            1 -> GroupedAudioPane(albumsGroups) { groupTracks ->
                 onPlayTracks(groupTracks, 0)
                 onOpenNowPlaying()
             }
-            2 -> GroupedAudioPane(allTracks.groupBy { it.artist }) { groupTracks ->
+            2 -> GroupedAudioPane(artistsGroups) { groupTracks ->
                 onPlayTracks(groupTracks, 0)
                 onOpenNowPlaying()
             }
-            3 -> GroupedAudioPane(allTracks.groupBy { it.folderPath.substringAfterLast('/') }) { groupTracks ->
+            3 -> GroupedAudioPane(foldersGroups) { groupTracks ->
                 onPlayTracks(groupTracks, 0)
                 onOpenNowPlaying()
             }
-            4 -> TrackListPane(hiResDolby, listState) { idx ->
+            4 -> TrackListPane(hiResDolby, hiResListState) { idx ->
                 onPlayTracks(hiResDolby, idx)
                 onOpenNowPlaying()
             }
             5 -> LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                itemsIndexed(playlists) { _, pl ->
-                    Surface(color = Color(0xFF111827), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+                itemsIndexed(playlists, key = { _, p -> p.playlistId }) { _, pl ->
+                    val resolvedTracks = remember(pl.trackUrisJson, tracksByUri) {
+                        val uris = runCatching {
+                            Json.decodeFromString<List<String>>(pl.trackUrisJson)
+                        }.getOrDefault(emptyList())
+                        uris.mapNotNull { tracksByUri[it] }
+                    }
+                    Surface(
+                        color = Color(0xFF111827),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = resolvedTracks.isNotEmpty()) {
+                                onPlayTracks(resolvedTracks, 0)
+                                onOpenNowPlaying()
+                            },
+                    ) {
                         Column(modifier = Modifier.padding(14.dp)) {
-                            Text(pl.name, color = Color.White, fontWeight = FontWeight.SemiBold)
-                            Text("Custom / Imported Playlist", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                            Text(pl.name, color = Color.White, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(
+                                "${resolvedTracks.size} tracks • Custom / Imported Playlist",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 12.sp,
+                            )
                         }
                     }
                 }
@@ -180,11 +209,18 @@ private fun GroupedAudioPane(
     }
 }
 
-fun formatAudioBadge(track: AudioTrackEntity): String? = when {
-    track.isDolbyAtmos -> "DOLBY ATMOS"
-    track.isDolbyAc4 -> "AC-4"
-    track.isDsd -> "DSD"
-    track.sampleRateHz > 48000 || track.bitDepth > 16 -> "HI-RES ${track.bitDepth}/${track.sampleRateHz / 1000}"
-    track.isLossless -> "LOSSLESS ${track.codec.uppercase()}"
-    else -> null
+fun formatAudioBadge(track: AudioTrackEntity): String? {
+    val rateStr = if (track.sampleRateHz % 1000 == 0) {
+        "${track.sampleRateHz / 1000}"
+    } else {
+        String.format(Locale.US, "%.1f", track.sampleRateHz / 1000f)
+    }
+    return when {
+        track.isDolbyAtmos -> "DOLBY ATMOS"
+        track.isDolbyAc4 -> "AC-4"
+        track.isDsd -> "DSD"
+        track.sampleRateHz > 48000 || track.bitDepth > 16 -> "HI-RES ${track.bitDepth}/$rateStr"
+        track.isLossless -> "LOSSLESS ${track.codec.uppercase(Locale.US)}"
+        else -> null
+    }
 }

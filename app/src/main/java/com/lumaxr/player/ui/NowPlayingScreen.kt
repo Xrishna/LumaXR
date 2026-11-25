@@ -5,6 +5,8 @@ import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,6 +41,8 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -56,14 +60,24 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.graphics.drawable.toBitmap
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
+import coil.imageLoader
+import coil.request.ImageRequest
+import coil.request.SuccessResult
 import com.lumaxr.player.lyrics.AmLyricsView
 import com.lumaxr.player.visuals.AgslAlbumBackdrop
 import com.lumaxr.player.visuals.VisualStudioRenderer
 import com.lumaxr.player.visuals.VisualizerMode
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Tablet-First 16:10 Landscape Dual-Pane Now Playing:
@@ -80,6 +94,7 @@ fun NowPlayingScreen(
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val coordinator = viewModel.container.musicCoordinator
     val state by coordinator.state.collectAsState()
     val lyricsState by viewModel.lyricsState.collectAsState()
@@ -93,6 +108,7 @@ fun NowPlayingScreen(
     var showSignalPath by remember { mutableStateOf(false) }
     var showVisualStudio by remember { mutableStateOf(false) }
     var showLyricsStudio by remember { mutableStateOf(false) }
+    var glSurfaceViewRef by remember { mutableStateOf<GLSurfaceView?>(null) }
 
     val renderer = remember {
         VisualStudioRenderer(
@@ -104,6 +120,39 @@ fun NowPlayingScreen(
     }
 
     val track = state.currentTrack
+    val oscPath = remember { Path() }
+
+    LaunchedEffect(track?.artworkUri) {
+        val artUri = track?.artworkUri?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        val req = ImageRequest.Builder(context)
+            .data(artUri)
+            .allowHardware(false)
+            .size(512)
+            .build()
+        val res = withContext(Dispatchers.IO) {
+            runCatching { context.imageLoader.execute(req) }.getOrNull()
+        }
+        val bmp = (res as? SuccessResult)?.drawable?.toBitmap(config = android.graphics.Bitmap.Config.ARGB_8888)
+        if (bmp != null) {
+            renderer.submitArtworkOrVideoFrame(bmp)
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, glSurfaceViewRef) {
+        val view = glSurfaceViewRef
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> view?.onResume()
+                Lifecycle.Event.ON_PAUSE -> view?.onPause()
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            view?.onPause()
+        }
+    }
 
     Box(
         modifier = Modifier
@@ -119,7 +168,7 @@ fun NowPlayingScreen(
                         setEGLWindowSurfaceFactory(VisualStudioRenderer.createSrgbWindowFactory())
                         setRenderer(renderer)
                         renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
-                    }
+                    }.also { glSurfaceViewRef = it }
                 },
                 modifier = Modifier.fillMaxSize(),
             )
@@ -146,14 +195,14 @@ fun NowPlayingScreen(
             }
         } else if (glowConfig.visualizerMode == VisualizerMode.OSCILLOSCOPE_LISSAJOUS) {
             Canvas(modifier = Modifier.fillMaxSize().padding(32.dp)) {
-                val path = Path()
+                oscPath.rewind()
                 val samples = fftFrame.waveformSamples
                 samples.forEachIndexed { idx, s ->
                     val x = (idx.toFloat() / (samples.size - 1).coerceAtLeast(1)) * size.width
                     val y = size.height * 0.8f + s * size.height * 0.14f
-                    if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    if (idx == 0) oscPath.moveTo(x, y) else oscPath.lineTo(x, y)
                 }
-                drawPath(path, color = Color(0x8838BDF8), style = Stroke(width = 3f))
+                drawPath(oscPath, color = Color(0x8838BDF8), style = Stroke(width = 3f))
             }
         }
 
@@ -239,8 +288,21 @@ fun NowPlayingScreen(
                     }
 
                     Spacer(Modifier.height(16.dp))
-                    Text(track?.title ?: "No Track Selected", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                    Text("${track?.artist ?: ""} • ${track?.album ?: ""}", color = Color(0xFF94A3B8), fontSize = 13.sp)
+                    Text(
+                        track?.title ?: "No Track Selected",
+                        color = Color.White,
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${track?.artist ?: ""} • ${track?.album ?: ""}",
+                        color = Color(0xFF94A3B8),
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                     Spacer(Modifier.height(16.dp))
 
                     // Real Waveform Seekbar
@@ -248,8 +310,8 @@ fun NowPlayingScreen(
                     WaveformSeekbar(
                         peaks = peaks,
                         progress = progress,
-                        onSeekFraction = { frac ->
-                            viewModel.container.haptics.playSeekDetent()
+                        onSeekFraction = { frac, emitHaptic ->
+                            if (emitHaptic) viewModel.container.haptics.playSeekDetent()
                             coordinator.seekToMs((frac * state.durationMs).toLong())
                         },
                     )
@@ -320,9 +382,25 @@ fun NowPlayingScreen(
                                     shape = RoundedCornerShape(12.dp),
                                     modifier = Modifier.fillMaxWidth().clickable { coordinator.playQueue(state.queue, idx) },
                                 ) {
-                                    Row(modifier = Modifier.padding(12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                                        Text("${idx + 1}. ${q.title}", color = Color.White)
-                                        Text(q.artist, color = Color(0xFF94A3B8), fontSize = 12.sp)
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            "${idx + 1}. ${q.title}",
+                                            color = Color.White,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                        )
+                                        Text(
+                                            q.artist,
+                                            color = Color(0xFF94A3B8),
+                                            fontSize = 12.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
                                     }
                                 }
                             }
@@ -363,23 +441,33 @@ fun NowPlayingScreen(
 private fun WaveformSeekbar(
     peaks: List<Float>,
     progress: Float,
-    onSeekFraction: (Float) -> Unit,
+    onSeekFraction: (Float, Boolean) -> Unit,
 ) {
+    var lastHapticBucket by remember { mutableIntStateOf(-1) }
     Canvas(
         modifier = Modifier
             .fillMaxWidth()
             .height(52.dp)
             .pointerInput(peaks) {
-                awaitPointerEventScope {
-                    while (true) {
-                        val ev = awaitPointerEvent()
-                        val p = ev.changes.firstOrNull() ?: continue
-                        if (p.pressed) {
-                            val frac = (p.position.x / size.width.toFloat()).coerceIn(0f, 1f)
-                            onSeekFraction(frac)
-                        }
-                    }
+                detectTapGestures { offset ->
+                    val frac = (offset.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                    onSeekFraction(frac, true)
                 }
+            }
+            .pointerInput(peaks) {
+                detectHorizontalDragGestures(
+                    onDragStart = { lastHapticBucket = -1 },
+                    onDragEnd = { lastHapticBucket = -1 },
+                    onDragCancel = { lastHapticBucket = -1 },
+                    onHorizontalDrag = { change, _ ->
+                        change.consume()
+                        val frac = (change.position.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                        val bucket = (frac * 40f).toInt()
+                        val emitHaptic = bucket != lastHapticBucket
+                        lastHapticBucket = bucket
+                        onSeekFraction(frac, emitHaptic)
+                    },
+                )
             },
     ) {
         val count = peaks.size.coerceAtLeast(1)

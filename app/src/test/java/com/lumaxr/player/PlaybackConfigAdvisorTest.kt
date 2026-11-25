@@ -109,4 +109,35 @@ class PlaybackConfigAdvisorTest {
         assertThat(throttled.scaler).isEqualTo("bilinear")
         assertThat(throttled.debandEnabled).isFalse()
     }
+
+    @Test
+    fun uhd4k10BitStreamDoesNotEnableAnimeDebandOrSharpen() {
+        val stream4k = ProbedMediaInfo(
+            uri = "https://cdn.example/demo_4k_av1.mkv",
+            title = "Demo 4K",
+            container = "MKV",
+            hdrFormat = HdrFormat.HDR10,
+            width = 3840,
+            height = 2160,
+            bitDepth = 10,
+            bitrateMbps = 10.5,
+            fps = 23.976,
+            videoCodec = "av1",
+            audioCodec = "opus",
+            durationMs = 600_000L,
+        )
+        val plan = advisor.buildConfigPlan(
+            media = stream4k,
+            preset = XrPreset.CINEMA_MASTERING_XR,
+            useVulkan = true,
+            estimatedDisplayNits = 180f,
+            manualTargetPeakNits = null,
+            experimentalHbmHdrMode = false,
+            displayHighestHdrSdrRatio = 2.25f,
+            hdrToysMapper = HdrToysToneMapper.OFF,
+        )
+        assertThat(plan.debandEnabled).isFalse()
+        assertThat(plan.sharpen).isEqualTo(0.0f)
+        assertThat(plan.scaler).isEqualTo("spline36")
+    }
 }

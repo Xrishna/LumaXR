@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.lumaxr.player.music.MusicPlaybackState
+import java.util.Locale
 
 /**
  * Persistent frosted-glass MiniPlayer pinned at zIndex(20f) inside the root SharedTransitionLayout.
@@ -73,10 +74,12 @@ fun MiniPlayerBar(
                 .fillMaxWidth()
                 .lumaPressScale(interaction)
                 .pointerInput(track.uri) {
+                    val swipeThresholdPx = 48.dp.toPx()
                     detectHorizontalDragGestures(
+                        onDragCancel = { dragAccum = 0f },
                         onDragEnd = {
-                            if (dragAccum < -90f) onNext()
-                            else if (dragAccum > 90f) onPrev()
+                            if (dragAccum < -swipeThresholdPx) onNext()
+                            else if (dragAccum > swipeThresholdPx) onPrev()
                             dragAccum = 0f
                         },
                         onHorizontalDrag = { _, dx -> dragAccum += dx },
@@ -129,8 +132,13 @@ fun MiniPlayerBar(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
+                        val rateLabel = if (track.sampleRateHz % 1000 == 0) {
+                            "${track.sampleRateHz / 1000}k"
+                        } else {
+                            String.format(Locale.US, "%.1fk", track.sampleRateHz / 1000f)
+                        }
                         Text(
-                            text = "${track.artist} • ${track.codec.uppercase()} ${track.bitDepth}/${track.sampleRateHz / 1000}k",
+                            text = "${track.artist} • ${track.codec.uppercase(Locale.US)} ${track.bitDepth}/$rateLabel",
                             color = Color(0xFF94A3B8),
                             fontSize = 12.sp,
                             maxLines = 1,

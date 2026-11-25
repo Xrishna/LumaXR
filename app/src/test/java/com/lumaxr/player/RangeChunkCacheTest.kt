@@ -39,5 +39,12 @@ class RangeChunkCacheTest {
         val cachedSlice = cache.readRange("test_movie", source, offset = 950L, length = 300)
         assertThat(cachedSlice).isEqualTo(payload.copyOfRange(950, 1250))
         assertThat(readCalls).isEqualTo(callsAfterFirstRead)
+
+        // Clamps cleanly at EOF and returns empty on out-of-range offset
+        val tail = cache.readRange("test_movie", source, offset = 4950L, length = 200)
+        assertThat(tail).isEqualTo(payload.copyOfRange(4950, 5000))
+        assertThat(cache.readRange("test_movie", source, offset = 6000L, length = 10)).isEmpty()
+
+        tempDir.deleteRecursively()
     }
 }

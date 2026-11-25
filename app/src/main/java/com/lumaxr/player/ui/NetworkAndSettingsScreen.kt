@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -26,17 +27,19 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lumaxr.player.BuildConfig
@@ -58,20 +61,28 @@ fun NetworkAndSettingsScreen(
     val refreshPolicy by viewModel.refreshPolicy.collectAsState()
     val experimentalHbm by viewModel.experimentalHbm.collectAsState()
     val servers by viewModel.networkServers.collectAsState()
-    val remoteEntries by viewModel.remoteEntries.collectAsState()
+    val remoteEntriesByServer by viewModel.remoteEntriesByServer.collectAsState()
+    val backupStatus by viewModel.backupStatus.collectAsState()
 
-    var hostInput by remember { mutableStateOf("192.168.1.10") }
-    var shareInput by remember { mutableStateOf("Media") }
-    var userInput by remember { mutableStateOf("") }
-    var passInput by remember { mutableStateOf("") }
-    var proto by remember { mutableStateOf(NetworkProtocol.SMB) }
+    LaunchedEffect(backupStatus) {
+        val msg = backupStatus
+        if (!msg.isNullOrBlank()) {
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            viewModel.clearBackupStatus()
+        }
+    }
+
+    var hostInput by rememberSaveable { mutableStateOf("192.168.1.10") }
+    var shareInput by rememberSaveable { mutableStateOf("Media") }
+    var userInput by rememberSaveable { mutableStateOf("") }
+    var passInput by rememberSaveable { mutableStateOf("") }
+    var proto by rememberSaveable { mutableStateOf(NetworkProtocol.SMB) }
 
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/zip"),
     ) { uri ->
         if (uri != null) {
             viewModel.exportBackup(uri)
-            Toast.makeText(context, "LumaXR Backup Exported", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -80,7 +91,6 @@ fun NetworkAndSettingsScreen(
     ) { uri ->
         if (uri != null) {
             viewModel.importBackup(uri)
-            Toast.makeText(context, "LumaXR Config & Stats Imported", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -88,6 +98,7 @@ fun NetworkAndSettingsScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(top = 86.dp, bottom = 160.dp, start = 20.dp, end = 20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -159,17 +170,25 @@ fun NetworkAndSettingsScreen(
                         FilterChip(selected = proto == p, onClick = { proto = p }, label = { Text(p.name, fontSize = 11.sp) })
                     }
                 }
-                OutlinedTextField(value = hostInput, onValueChange = { hostInput = it }, label = { Text("Host / Server URL") }, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(value = shareInput, onValueChange = { shareInput = it }, label = { Text("Share / Library") }, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = hostInput, onValueChange = { hostInput = it }, label = { Text("Host / Server URL") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = shareInput, onValueChange = { shareInput = it }, label = { Text("Share / Library") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(value = userInput, onValueChange = { userInput = it }, label = { Text("User") }, modifier = Modifier.weight(1f))
-                    OutlinedTextField(value = passInput, onValueChange = { passInput = it }, label = { Text("Pass / API Token") }, modifier = Modifier.weight(1f))
+                    OutlinedTextField(value = userInput, onValueChange = { userInput = it }, label = { Text("User") }, singleLine = true, modifier = Modifier.weight(1f))
+                    OutlinedTextField(
+                        value = passInput,
+                        onValueChange = { passInput = it },
+                        label = { Text("Pass / API Token") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.weight(1f),
+                    )
                 }
                 Button(
+                    enabled = hostInput.isNotBlank(),
                     onClick = {
                         val srv = NetworkServerConfig(
                             id = UUID.randomUUID().toString(),
-                            name = "${proto.name} ($hostInput)",
+                            name = "${proto.name} (${hostInput.trim()})",
                             protocol = proto,
                             hostOrUrl = hostInput.trim(),
                             shareOrLibrary = shareInput.trim(),
@@ -185,7 +204,8 @@ fun NetworkAndSettingsScreen(
 
                 servers.forEach { srv ->
                     Text("Server: ${srv.name}", color = Color(0xFFCBD5E1), fontSize = 12.sp)
-                    remoteEntries.forEach { entry ->
+                    val entries = remoteEntriesByServer[srv.id].orEmpty()
+                    entries.forEach { entry ->
                         Surface(
                             color = Color(0xFF1E293B),
                             shape = RoundedCornerShape(10.dp),

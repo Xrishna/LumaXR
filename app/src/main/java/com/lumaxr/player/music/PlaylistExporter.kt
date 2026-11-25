@@ -3,6 +3,8 @@ package com.lumaxr.player.music
 import com.lumaxr.player.data.AudioTrackEntity
 import com.lumaxr.player.data.MusicLibraryDao
 import com.lumaxr.player.data.MusicPlaylistEntity
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -14,19 +16,16 @@ data class ExportedPlaylistDto(
     val tracks: List<String>,
 )
 
-/**
- * M3U8 and JSON Playlist Import & Export.
- */
 class PlaylistExporter(private val musicDao: MusicLibraryDao) {
 
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
 
     fun exportM3u8(playlistName: String, tracks: List<AudioTrackEntity>): String = buildString {
         appendLine("#EXTM3U")
-        appendLine("#PLAYLIST:$playlistName")
+        appendLine("#PLAYLIST:${sanitizeLine(playlistName)}")
         for (t in tracks) {
             val sec = (t.durationMs / 1000L).coerceAtLeast(0L)
-            appendLine("#EXTINF:$sec,${t.artist} - ${t.title}")
+            appendLine("#EXTINF:$sec,${sanitizeLine(t.artist)} - ${sanitizeLine(t.title)}")
             appendLine(t.uri)
         }
     }
@@ -35,7 +34,7 @@ class PlaylistExporter(private val musicDao: MusicLibraryDao) {
         return json.encodeToString(ExportedPlaylistDto(playlistName, tracks.map { it.uri }))
     }
 
-    suspend fun importM3u8OrJson(defaultName: String, rawText: String): MusicPlaylistEntity {
+    suspend fun importM3u8OrJson(defaultName: String, rawText: String): MusicPlaylistEntity = withContext(Dispatchers.IO) {
         val trimmed = rawText.trimStart('\uFEFF').trim()
         val uris: List<String>
         var resolvedName = defaultName
@@ -63,6 +62,8 @@ class PlaylistExporter(private val musicDao: MusicLibraryDao) {
             trackUrisJson = json.encodeToString(uris),
         )
         musicDao.upsertPlaylist(entity)
-        return entity
+        entity
     }
+
+    private fun sanitizeLine(s: String): String = s.replace("\r", " ").replace("\n", " ").trim()
 }

@@ -18,9 +18,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ShaderBrush
 import androidx.compose.ui.graphics.asComposeRenderEffect
 
-/**
- * Android 14-16 AGSL RuntimeShader Mesh Gradient & API 36 RuntimeColorFilter helper.
- */
 object AgslAlbumBackdrop {
 
     private const val MESH_AGSL = """
@@ -44,7 +41,7 @@ object AgslAlbumBackdrop {
         vec4 main(half4 in_color) {
             float luma = dot(in_color.rgb, half3(0.2126, 0.7152, 0.0722));
             half3 boosted = mix(half3(luma), in_color.rgb, half(u_sat));
-            return vec4(clamp(boosted, 0.0, 1.0), in_color.a);
+            return vec4(clamp(boosted, half3(0.0), half3(in_color.a)), in_color.a);
         }
     """
 
@@ -71,12 +68,14 @@ object AgslAlbumBackdrop {
         modifier: Modifier = Modifier,
     ) {
         val shader = remember { RuntimeShader(MESH_AGSL) }
+        val brush = remember(shader) { ShaderBrush(shader) }
         var timeSec by remember { mutableFloatStateOf(0f) }
 
         LaunchedEffect(Unit) {
-            val start = System.nanoTime()
+            var start = 0L
             while (true) {
                 withFrameNanos { now ->
+                    if (start == 0L) start = now
                     timeSec = (now - start) / 1_000_000_000f
                 }
             }
@@ -88,7 +87,7 @@ object AgslAlbumBackdrop {
             shader.setFloatUniform("u_c1", primaryColor.red, primaryColor.green, primaryColor.blue)
             shader.setFloatUniform("u_c2", secondaryColor.red, secondaryColor.green, secondaryColor.blue)
             shader.setFloatUniform("u_dim", dimmer.coerceIn(0.15f, 1f))
-            drawRect(brush = ShaderBrush(shader))
+            drawRect(brush = brush)
         }
     }
 }

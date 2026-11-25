@@ -14,17 +14,14 @@ uniform float u_dimmer;
 uniform vec3 u_dark_tint;
 uniform float u_dark_tint_intensity;
 
-// Audio FFT energy bands [0..1+]
 uniform float u_bass;
 uniform float u_mid;
 uniform float u_treble;
 uniform float u_beat_reactivity;
 
-// Glow Controls
-// 0=Off, 1=SoftBloom, 2=NeonCore, 3=ChromaticPrism, 4=CrispRim, 5=AdaptiveArtwork
 uniform int u_glow_type;
-uniform float u_glow_intensity; // 0.0 .. 2.0
-uniform float u_glow_radius;    // 0.0 .. 3.0
+uniform float u_glow_intensity;
+uniform float u_glow_radius;
 uniform vec3 u_accent_color;
 uniform vec2 u_resolution;
 
@@ -65,57 +62,58 @@ vec3 adjust_saturation(vec3 col, float sat) {
 vec3 linear_to_srgb(vec3 c) {
     c = max(c, vec3(0.0));
     vec3 lo = c * 12.92;
-    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    vec3 hi = 1.055 * pow(max(c, vec3(1e-5)), vec3(1.0 / 2.4)) - 0.055;
     return clamp(mix(hi, lo, lessThanEqual(c, vec3(0.0031308))), 0.0, 1.0);
 }
 
-// Interleaved gradient noise + temporal golden ratio offset for TPDF 8-bit sRGB dithering
+// Two decorrelated interleaved gradient noise samples for TPDF dithering
 float tpdf_dither(vec2 frag_coord, float frame_idx) {
-    float n1 = fract(52.9829189 * fract(dot(frag_coord + frame_idx * 0.61803398875, vec2(0.06711056, 0.00583715))));
-    float n2 = fract(52.9829189 * fract(dot(frag_coord + (frame_idx + 17.0) * 0.61803398875, vec2(0.06711056, 0.00583715))));
+    float f = mod(frame_idx, 1024.0);
+    float n1 = fract(52.9829189 * fract(dot(frag_coord + f * 0.61803398875, vec2(0.06711056, 0.00583715))));
+    float n2 = fract(52.9829189 * fract(dot(frag_coord.yx + f * 0.38196601125, vec2(0.00583715, 0.06711056))));
     return (n1 + n2 - 1.0) / 255.0;
 }
 
 void main() {
     float react = u_beat_reactivity;
-    float t = u_time * u_warp_speed + u_bass * 0.35 * react;
+    float wrapped_t = mod(u_time, 3600.0);
+    float t = wrapped_t * u_warp_speed + u_bass * 0.35 * react;
     float warp_amp = u_warp_scale * (0.22 + 0.18 * u_bass * react + 0.08 * u_mid * react);
 
-    // Justin Zhang Diffuse-inspired double domain warping
     vec2 p = (v_uv - 0.5) * 2.2;
     vec2 q = vec2(fbm(p + vec2(0.0, t * 0.11)), fbm(p + vec2(5.2, -t * 0.09)));
     vec2 r = vec2(fbm(p + 2.4 * q + vec2(1.7, 9.2) + t * 0.14),
                   fbm(p + 2.4 * q + vec2(8.3, 2.8) - t * 0.12));
 
-    vec2 warped_uv = clamp(v_uv + (r - 0.5) * warp_amp, vec2(0.01), vec2(0.99));
+    vec2 edge_min = vec2(0.002);
+    vec2 edge_max = vec2(0.998);
+    vec2 warped_uv = clamp(v_uv + (r - 0.46875) * warp_amp, edge_min, edge_max);
     vec3 base = texture(u_tex, warped_uv).rgb;
 
-    // Optional Glow Pass (SoftBloom, NeonCore, ChromaticPrism, CrispRim, AdaptiveArtwork)
     if (u_glow_type > 0 && u_glow_intensity > 0.001) {
         vec2 texel = (1.0 / max(u_resolution, vec2(64.0))) * (1.0 + u_glow_radius * 6.0);
         vec3 bloom = vec3(0.0);
         if (u_glow_type == 3) {
-            // Chromatic Prism dispersion
-            bloom.r = texture(u_tex, clamp(warped_uv + texel * 1.4, 0.01, 0.99)).r;
+            bloom.r = texture(u_tex, clamp(warped_uv + texel * 1.4, edge_min, edge_max)).r;
             bloom.g = texture(u_tex, warped_uv).g;
-            bloom.b = texture(u_tex, clamp(warped_uv - texel * 1.4, 0.01, 0.99)).b;
+            bloom.b = texture(u_tex, clamp(warped_uv - texel * 1.4, edge_min, edge_max)).b;
         } else {
-            bloom += texture(u_tex, clamp(warped_uv + vec2(texel.x, 0.0), 0.01, 0.99)).rgb;
-            bloom += texture(u_tex, clamp(warped_uv - vec2(texel.x, 0.0), 0.01, 0.99)).rgb;
-            bloom += texture(u_tex, clamp(warped_uv + vec2(0.0, texel.y), 0.01, 0.99)).rgb;
-            bloom += texture(u_tex, clamp(warped_uv - vec2(0.0, texel.y), 0.01, 0.99)).rgb;
+            bloom += texture(u_tex, clamp(warped_uv + vec2(texel.x, 0.0), edge_min, edge_max)).rgb;
+            bloom += texture(u_tex, clamp(warped_uv - vec2(texel.x, 0.0), edge_min, edge_max)).rgb;
+            bloom += texture(u_tex, clamp(warped_uv + vec2(0.0, texel.y), edge_min, edge_max)).rgb;
+            bloom += texture(u_tex, clamp(warped_uv - vec2(0.0, texel.y), edge_min, edge_max)).rgb;
             bloom *= 0.25;
         }
         float pulse = 1.0 + (u_bass * 0.45 + u_treble * 0.25) * react;
-        vec3 glow_tint = (u_glow_type == 5) ? u_accent_color : bloom;
-        float core_curve = (u_glow_type == 2) ? pow(max(dot(bloom, vec3(0.333)), 0.0), 1.6) * 2.2 : 1.0;
+        float bloom_luma = dot(bloom, vec3(0.2126, 0.7152, 0.0722));
+        vec3 glow_tint = (u_glow_type == 5) ? (u_accent_color * max(bloom_luma, 0.15)) : bloom;
+        float core_curve = (u_glow_type == 2) ? pow(max(bloom_luma, 0.0), 1.6) * 2.2 : 1.0;
         float rim = (u_glow_type == 4) ? length(bloom - base) * 3.0 : 1.0;
         base += glow_tint * (0.28 * u_glow_intensity * pulse * core_curve * rim);
     }
 
     base = adjust_saturation(base, u_saturation);
 
-    // Dark-area tinting (protects IPS LCD contrast and keeps lyrics crisp)
     float luma = dot(base, vec3(0.2126, 0.7152, 0.0722));
     float dark_mask = 1.0 - smoothstep(0.05, 0.45, luma);
     base = mix(base, u_dark_tint, dark_mask * u_dark_tint_intensity);

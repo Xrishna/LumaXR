@@ -1,6 +1,7 @@
 package com.lumaxr.player.ui
 
 import android.app.Application
+import android.content.ContentUris
 import android.content.Context
 import android.net.Uri
 import android.provider.MediaStore
@@ -24,6 +25,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
@@ -108,27 +113,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _networkServers = MutableStateFlow<List<NetworkServerConfig>>(emptyList())
     val networkServers: StateFlow<List<NetworkServerConfig>> = _networkServers.asStateFlow()
 
-    private val _remoteEntries = MutableStateFlow<List<RemoteMediaEntry>>(emptyList())
-    val remoteEntries: StateFlow<List<RemoteMediaEntry>> = _remoteEntries.asStateFlow()
+    private val _remoteEntriesByServer = MutableStateFlow<Map<String, List<RemoteMediaEntry>>>(emptyMap())
+    val remoteEntriesByServer: StateFlow<Map<String, List<RemoteMediaEntry>>> = _remoteEntriesByServer.asStateFlow()
+
+    private val _backupStatus = MutableStateFlow<String?>(null)
+    val backupStatus: StateFlow<String?> = _backupStatus.asStateFlow()
 
     init {
         refreshMediaLibraries()
         viewModelScope.launch {
-            container.musicCoordinator.state.collect { st ->
-                val track = st.currentTrack
-                if (st.audioSessionId > 0) {
-                    container.audioFftAnalyzer.bindToSession(st.audioSessionId)
+            container.musicCoordinator.state
+                .map { it.audioSessionId }
+                .filter { it > 0 }
+                .distinctUntilChanged()
+                .collect { sessionId ->
+                    container.audioFftAnalyzer.bindToSession(sessionId)
                 }
-                if (track != null) {
-                    launch {
-                        _lyricsState.value = container.lyricsRepository.loadLyricsForTrack(track)
-                    }
-                    launch {
-                        _waveformPeaks.value = container.waveformExtractor.getOrExtractPeaks(track.uri)
-                    }
-                }
-            }
         }
+        viewModelScope.launch {
+            container.musicCoordinator.state
+                .map { it.currentTrack }
+                .distinctUntilChanged { old, new -> old?.uri == new?.uri }
+                .collectLatest { track ->
+                    if (track != null) {
+                        launch {
+                            _lyricsState.value = container.lyricsRepository.loadLyricsForTrack(track)
+                        }
+                        launch {
+                            _waveformPeaks.value = container.waveformExtractor.getOrExtractPeaks(track.uri)
+                        }
+                    } else {
+                        _lyricsState.value = LoadedLyricsState()
+                    }
+                }
+        }
+    }
+
+    override fun onCleared() {
+        container.audioFftAnalyzer.release()
+        super.onCleared()
     }
 
     fun refreshMediaLibraries() {
@@ -144,6 +167,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val ctx = getApplication<Application>()
         val list = mutableListOf<VideoLibraryItem>()
         val proj = arrayOf(
+            MediaStore.Video.Media._ID,
             MediaStore.Video.Media.DATA,
             MediaStore.Video.Media.TITLE,
             MediaStore.Video.Media.DURATION,
@@ -151,30 +175,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             MediaStore.Video.Media.HEIGHT,
             MediaStore.Video.Media.SIZE,
         )
-        ctx.contentResolver.query(
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-            proj,
-            null,
-            null,
-            "${MediaStore.Video.Media.DATE_MODIFIED} DESC",
-        )?.use { c ->
-            val colData = c.getColumnIndexOrThrow(MediaStore.Video.Media.DATA)
-            val colTitle = c.getColumnIndexOrThrow(MediaStore.Video.Media.TITLE)
-            val colDur = c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
-            val colW = c.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH)
-            val colH = c.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT)
-            val colSize = c.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
-            while (c.moveToNext()) {
-                val path = c.getString(colData) ?: continue
-                list += VideoLibraryItem(
-                    uri = path,
-                    title = c.getString(colTitle) ?: File(path).nameWithoutExtension,
-                    folderPath = File(path).parent.orEmpty(),
-                    durationMs = c.getLong(colDur),
-                    width = c.getInt(colW),
-                    height = c.getInt(colH),
-                    sizeBytes = c.getLong(colSize),
-                )
+        runCatching {
+            ctx.contentResolver.query(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                proj,
+                null,
+                null,
+                "${MediaStore.Video.Media.DATE_MODIFIED} DESC",
+            )?.use { c ->
+                val colId = c.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                val colData = c.getColumnIndex(MediaStore.Video.Media.DATA)
+                val colTitle = c.getColumnIndexOrThrow(MediaStore.Video.Media.TITLE)
+                val colDur = c.getColumnIndexOrThrow(MediaStore.Video.Media.DURATION)
+                val colW = c.getColumnIndexOrThrow(MediaStore.Video.Media.WIDTH)
+                val colH = c.getColumnIndexOrThrow(MediaStore.Video.Media.HEIGHT)
+                val colSize = c.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
+                while (c.moveToNext()) {
+                    val id = c.getLong(colId)
+                    val rawPath = if (colData >= 0) c.getString(colData) else null
+                    val resolvedUri = if (!rawPath.isNullOrBlank()) {
+                        rawPath
+                    } else {
+                        ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id).toString()
+                    }
+                    val fallbackTitle = if (!rawPath.isNullOrBlank()) {
+                        File(rawPath).nameWithoutExtension
+                    } else {
+                        "Video $id"
+                    }
+                    list += VideoLibraryItem(
+                        uri = resolvedUri,
+                        title = c.getString(colTitle)?.takeIf { it.isNotBlank() } ?: fallbackTitle,
+                        folderPath = if (!rawPath.isNullOrBlank()) File(rawPath).parent.orEmpty() else "",
+                        durationMs = c.getLong(colDur),
+                        width = c.getInt(colW),
+                        height = c.getInt(colH),
+                        sizeBytes = c.getLong(colSize),
+                    )
+                }
             }
         }
         _videos.value = list
@@ -204,10 +242,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateLyricsOffset(offsetMs: Int) {
+        val clamped = offsetMs.coerceIn(-3000, 3000)
         val cur = _lyricsState.value
-        _lyricsState.value = cur.copy(offsetMs = offsetMs.coerceIn(-3000, 3000))
+        _lyricsState.value = cur.copy(offsetMs = clamped)
         if (cur.trackKey.isNotBlank()) {
-            viewModelScope.launch { container.lyricsRepository.saveOffset(cur.trackKey, offsetMs) }
+            viewModelScope.launch { container.lyricsRepository.saveOffset(cur.trackKey, clamped) }
         }
     }
 
@@ -242,16 +281,38 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun browseNetworkServer(server: NetworkServerConfig, path: String = "") {
         viewModelScope.launch {
-            _remoteEntries.value = container.networkMediaRepo.listDirectory(server, path)
+            val entries = container.networkMediaRepo.listDirectory(server, path)
+            _remoteEntriesByServer.value = _remoteEntriesByServer.value + (server.id to entries)
         }
     }
 
+    fun clearBackupStatus() {
+        _backupStatus.value = null
+    }
+
     fun exportBackup(uri: Uri?) {
-        viewModelScope.launch { container.backupManager.exportBackupZip(uri) }
+        viewModelScope.launch {
+            _backupStatus.value = runCatching {
+                val file = container.backupManager.exportBackupZip(uri)
+                if (uri != null) "LumaXR backup exported cleanly" else "Backup saved: ${file.name}"
+            }.getOrElse { err ->
+                "Backup export failed: ${err.message ?: "unknown error"}"
+            }
+        }
     }
 
     fun importBackup(uri: Uri) {
-        viewModelScope.launch { container.backupManager.importBackup(uri) }
+        viewModelScope.launch {
+            val res = container.backupManager.importBackup(uri)
+            _backupStatus.value = res.fold(
+                onSuccess = { payload ->
+                    "Imported ${payload.folderVideoConfigs.size} video configs & ${payload.playlists.size} playlists"
+                },
+                onFailure = { err ->
+                    "Backup import failed: ${err.message ?: "invalid archive"}"
+                },
+            )
+        }
     }
 
     private fun loadSavedGlowConfig(): GlowConfigState {

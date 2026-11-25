@@ -1,6 +1,7 @@
 package com.lumaxr.player.music
 
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.ln
 
 data class PeqFilter(
@@ -12,7 +13,7 @@ data class PeqFilter(
 data class AutoEqPreset(
     val name: String,
     val preampDb: Float,
-    val bandGainsDb: FloatArray, // 15-band ISO centers
+    val bandGainsDb: FloatArray,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -28,10 +29,6 @@ data class AutoEqPreset(
     }
 }
 
-/**
- * AutoEQ target curve & parametric PEQ / GraphicEQ CSV parser.
- * Maps arbitrary AutoEQ parametric filters onto LumaXR's 15-band ISO centers.
- */
 object AutoEqParser {
 
     val ISO_15_BANDS_HZ = floatArrayOf(
@@ -40,56 +37,49 @@ object AutoEqParser {
     )
 
     val BUILTIN_PRESETS: List<AutoEqPreset> = listOf(
+        AutoEqPreset("Flat Reference", 0f, FloatArray(15) { 0f }),
         AutoEqPreset(
-            name = "Flat Reference",
-            preampDb = 0f,
-            bandGainsDb = FloatArray(15) { 0f },
+            "Harman Over-Ear 2018",
+            -2.5f,
+            floatArrayOf(3.2f, 2.8f, 2.1f, 1.0f, -0.4f, -0.8f, -0.3f, 0.2f, 0.6f, 1.4f, 2.2f, 1.8f, 0.9f, -0.5f, -1.2f),
         ),
         AutoEqPreset(
-            name = "Harman Over-Ear 2018",
-            preampDb = -2.5f,
-            bandGainsDb = floatArrayOf(3.2f, 2.8f, 2.1f, 1.0f, -0.4f, -0.8f, -0.3f, 0.2f, 0.6f, 1.4f, 2.2f, 1.8f, 0.9f, -0.5f, -1.2f),
+            "Harman In-Ear 2019",
+            -3.0f,
+            floatArrayOf(4.0f, 3.4f, 2.5f, 1.2f, -0.5f, -1.0f, -0.4f, 0.3f, 1.0f, 2.1f, 3.0f, 2.0f, 0.5f, -0.8f, -1.5f),
         ),
         AutoEqPreset(
-            name = "Harman In-Ear 2019",
-            preampDb = -3.0f,
-            bandGainsDb = floatArrayOf(4.0f, 3.4f, 2.5f, 1.2f, -0.5f, -1.0f, -0.4f, 0.3f, 1.0f, 2.1f, 3.0f, 2.0f, 0.5f, -0.8f, -1.5f),
-        ),
-        AutoEqPreset(
-            name = "Redmi Pad Quad Speaker Warmth",
-            preampDb = -2.0f,
-            bandGainsDb = floatArrayOf(2.5f, 3.0f, 2.4f, 1.6f, 0.5f, -0.4f, -0.8f, 0.2f, 0.8f, 1.2f, 0.6f, -0.4f, -0.9f, -1.2f, -1.5f),
+            "Redmi Pad Quad Speaker Warmth",
+            -2.0f,
+            floatArrayOf(2.5f, 3.0f, 2.4f, 1.6f, 0.5f, -0.4f, -0.8f, 0.2f, 0.8f, 1.2f, 0.6f, -0.4f, -0.9f, -1.2f, -1.5f),
         ),
     )
 
-    /**
-     * Parses AutoEQ ParametricEQ.txt (`Filter 1: ON PK Fc 105 Hz Gain -3.1 dB Q 0.70`)
-     * or GraphicEQ CSV (`frequency,raw,error,...,gain`) into a 15-band AutoEqPreset.
-     */
     fun parseAutoEqText(name: String, rawText: String): AutoEqPreset {
         var preamp = 0f
         val filters = mutableListOf<PeqFilter>()
 
-        val lines = rawText.lines()
-        for (line in lines) {
+        for (line in rawText.lines()) {
             val trimmed = line.trim()
             if (trimmed.isEmpty()) continue
             if (trimmed.startsWith("Preamp:", ignoreCase = true)) {
-                preamp = trimmed.substringAfter(':').replace("dB", "", ignoreCase = true).trim().toFloatOrNull() ?: 0f
+                val parsed = trimmed.substringAfter(':').replace("dB", "", ignoreCase = true).trim().toFloatOrNull()
+                if (parsed != null && parsed.isFinite()) preamp = parsed
                 continue
             }
             if (trimmed.startsWith("Filter", ignoreCase = true) && trimmed.contains("Fc", ignoreCase = true)) {
+                if (Regex("""\bOFF\b""", RegexOption.IGNORE_CASE).containsMatchIn(trimmed)) continue
                 val fc = Regex("""Fc\s+([0-9.]+)""", RegexOption.IGNORE_CASE).find(trimmed)?.groupValues?.get(1)?.toFloatOrNull()
                 val gain = Regex("""Gain\s+(-?[0-9.]+)""", RegexOption.IGNORE_CASE).find(trimmed)?.groupValues?.get(1)?.toFloatOrNull()
                 val q = Regex("""Q\s+([0-9.]+)""", RegexOption.IGNORE_CASE).find(trimmed)?.groupValues?.get(1)?.toFloatOrNull() ?: 1.41f
-                if (fc != null && gain != null) {
+                if (fc != null && fc.isFinite() && fc > 0f && gain != null && gain.isFinite() && q.isFinite()) {
                     filters += PeqFilter(fc, gain, q)
                 }
             } else if (trimmed.first().isDigit() && trimmed.contains(",")) {
                 val cols = trimmed.split(",")
                 val fc = cols.getOrNull(0)?.trim()?.toFloatOrNull()
                 val gain = cols.lastOrNull()?.trim()?.toFloatOrNull()
-                if (fc != null && gain != null) {
+                if (fc != null && fc.isFinite() && fc > 0f && gain != null && gain.isFinite()) {
                     filters += PeqFilter(fc, gain, 1.41f)
                 }
             }
@@ -98,13 +88,16 @@ object AutoEqParser {
         val bands = FloatArray(ISO_15_BANDS_HZ.size) { idx ->
             val center = ISO_15_BANDS_HZ[idx]
             var acc = 0f
+            var weightSum = 0f
             for (f in filters) {
                 val octDist = abs(ln((center / f.frequencyHz).coerceAtLeast(0.01f)) / ln(2f))
                 val bw = 1.0f / f.qFactor.coerceIn(0.3f, 8f)
-                val weight = kotlin.math.exp(-0.5f * (octDist / bw) * (octDist / bw))
+                val weight = exp(-0.5f * (octDist / bw) * (octDist / bw))
                 acc += f.gainDb * weight
+                weightSum += weight
             }
-            acc.coerceIn(-12f, 12f)
+            val normalized = if (weightSum > 1.0f) acc / weightSum else acc
+            normalized.coerceIn(-12f, 12f)
         }
         return AutoEqPreset(name = name, preampDb = preamp.coerceIn(-12f, 6f), bandGainsDb = bands)
     }

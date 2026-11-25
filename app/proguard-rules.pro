@@ -1,19 +1,20 @@
 # LumaXR ProGuard / R8 Rules
--keepattributes Signature,InnerClasses,EnclosingMethod,*Annotation*
+-keepattributes Signature,InnerClasses,EnclosingMethod,*Annotation*,SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
 
-# Kotlinx Serialization
+# Kotlinx Serialization (classes, objects, enums)
 -keepclassmembers class kotlinx.serialization.json.** { *; }
 -keep,includedescriptorclasses class com.lumaxr.player.**$$serializer { *; }
 -keepclassmembers class com.lumaxr.player.** {
     *** Companion;
 }
+-keepclassmembers @kotlinx.serialization.Serializable class com.lumaxr.player.** {
+    public static final *** INSTANCE;
+    public *** serializer();
+}
 
 # mpv-android-lib JNI callbacks
 -keep class is.xyz.mpv.** { *; }
--keepclassmembers class is.xyz.mpv.** { *; }
-
-# Media3 / ExoPlayer & Dolby Codec2
--keep class androidx.media3.** { *; }
 
 # SMBJ & BouncyCastle
 -keep class com.hierynomus.** { *; }

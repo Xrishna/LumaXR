@@ -1,6 +1,7 @@
 package com.lumaxr.player.music
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
@@ -9,10 +10,12 @@ import android.media.session.MediaSession
 import com.lumaxr.player.data.DeviceEqProfileEntity
 import com.lumaxr.player.data.MusicLibraryDao
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 data class ActiveAudioRoute(
     val deviceKey: String = "SPEAKER_QUAD",
@@ -22,18 +25,20 @@ data class ActiveAudioRoute(
     val isWiredHeadset: Boolean = false,
 )
 
-/**
- * Automatic per-output-device EQ/AutoEQ/Crossfeed/Bit-Perfect profile switcher + MediaRouter2 Output Switcher.
- */
 class AudioDeviceProfileRouter(
-    private val context: Context,
+    context: Context,
     private val scope: CoroutineScope,
     private val musicDao: MusicLibraryDao,
     private val dspController: AudioDspController,
 ) {
-    private val audioManager = context.getSystemService(AudioManager::class.java)
+    private val appContext = context.applicationContext
+    private val audioManager = appContext.getSystemService(AudioManager::class.java)
+    private val lock = Any()
     private val _activeRoute = MutableStateFlow(ActiveAudioRoute())
     val activeRoute: StateFlow<ActiveAudioRoute> = _activeRoute.asStateFlow()
+
+    private var isStarted = false
+    private var evalJob: Job? = null
 
     private val callback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) = evaluateActiveRoute()
@@ -41,12 +46,21 @@ class AudioDeviceProfileRouter(
     }
 
     fun start() {
-        audioManager?.registerAudioDeviceCallback(callback, null)
+        synchronized(lock) {
+            if (isStarted) return
+            isStarted = true
+            audioManager?.registerAudioDeviceCallback(callback, null)
+        }
         evaluateActiveRoute()
     }
 
     fun stop() {
-        runCatching { audioManager?.unregisterAudioDeviceCallback(callback) }
+        synchronized(lock) {
+            if (!isStarted) return
+            isStarted = false
+            evalJob?.cancel()
+            runCatching { audioManager?.unregisterAudioDeviceCallback(callback) }
+        }
     }
 
     fun classifyRoute(outputs: List<AudioDeviceInfo>): ActiveAudioRoute {
@@ -58,7 +72,9 @@ class AudioDeviceProfileRouter(
             return ActiveAudioRoute("USB:$name", name, isUsbDac = true)
         }
         val bt = outputs.firstOrNull {
-            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
         }
         if (bt != null) {
             val name = bt.productName?.toString()?.ifBlank { "Bluetooth Audio" } ?: "Bluetooth Audio"
@@ -75,11 +91,19 @@ class AudioDeviceProfileRouter(
     }
 
     fun evaluateActiveRoute() {
-        val outputs = audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.toList().orEmpty()
+        val mediaAttrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+            .build()
+        val routed = runCatching { audioManager?.getDevicesForAttributes(mediaAttrs) }.getOrNull()
+        val outputs = if (!routed.isNullOrEmpty()) routed.toList()
+        else audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.toList().orEmpty()
+
         val route = classifyRoute(outputs)
         _activeRoute.value = route
 
-        scope.launch {
+        evalJob?.cancel()
+        evalJob = scope.launch {
             val saved = musicDao.getDeviceEqProfile(route.deviceKey)
             if (saved != null) {
                 val gains = saved.bandGainsDbCsv.split(",").mapNotNull { it.toFloatOrNull() }
@@ -90,11 +114,27 @@ class AudioDeviceProfileRouter(
                 dspController.updateToggles(
                     crossfeedEnabled = saved.crossfeedEnabled,
                     crossfeedStrength = saved.crossfeedStrength,
+                    diagnosticMode = if (saved.monoEnabled) DiagnosticAudioMode.MONO_SUM else DiagnosticAudioMode.NORMAL,
                     balanceLR = saved.balanceLR,
                 )
+                dspController.setBitPerfectBypass(saved.bitPerfectPreferred && route.isUsbDac)
             } else if (route.deviceKey == "SPEAKER_QUAD") {
-                val speakerPreset = AutoEqParser.BUILTIN_PRESETS.last()
+                val speakerPreset = AutoEqParser.BUILTIN_PRESETS.first { it.name.contains("Speaker") }
                 dspController.applyAutoEqPreset(speakerPreset)
+                dspController.updateToggles(
+                    crossfeedEnabled = false,
+                    diagnosticMode = DiagnosticAudioMode.NORMAL,
+                    balanceLR = 0f,
+                )
+                dspController.setBitPerfectBypass(false)
+            } else {
+                dspController.applyAutoEqPreset(AutoEqParser.BUILTIN_PRESETS.first())
+                dspController.updateToggles(
+                    crossfeedEnabled = false,
+                    diagnosticMode = DiagnosticAudioMode.NORMAL,
+                    balanceLR = 0f,
+                )
+                dspController.setBitPerfectBypass(false)
             }
         }
     }
@@ -107,7 +147,7 @@ class AudioDeviceProfileRouter(
                 deviceKey = route.deviceKey,
                 displayName = route.displayName,
                 autoEqName = s.activePresetName,
-                bandGainsDbCsv = s.bandGainsDb.joinToString(",") { "%.2f".format(it) },
+                bandGainsDbCsv = s.bandGainsDb.joinToString(",") { String.format(Locale.US, "%.2f", it) },
                 preampDb = s.preampDb,
                 crossfeedEnabled = s.crossfeedEnabled,
                 crossfeedStrength = s.crossfeedStrength,
@@ -119,7 +159,7 @@ class AudioDeviceProfileRouter(
     }
 
     fun showSystemOutputSwitcher(platformToken: MediaSession.Token? = null): Boolean {
-        val router = MediaRouter2.getInstance(context)
+        val router = MediaRouter2.getInstance(appContext)
         return runCatching {
             if (platformToken != null) {
                 router.showSystemOutputSwitcher(platformToken)

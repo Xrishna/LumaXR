@@ -6,12 +6,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -19,6 +21,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.lumaxr.player.music.SignalPathTelemetry
+import java.util.Locale
 
 /**
  * Roon / Poweramp-style Interactive Signal-Path Telemetry Sheet showing every live audio stage
@@ -30,13 +33,16 @@ fun SignalPathSheet(
     telemetry: SignalPathTelemetry,
     onDismiss: () -> Unit,
 ) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
         onDismissRequest = onDismiss,
+        sheetState = sheetState,
         containerColor = Color(0xFF0F172A),
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .navigationBarsPadding()
                 .padding(horizontal = 24.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -58,8 +64,16 @@ fun SignalPathSheet(
                         .padding(14.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    Text("Integrated Loudness: ${"%.1f".format(telemetry.lufs)} LUFS", color = Color(0xFFE2E8F0), fontSize = 13.sp)
-                    Text("True-Peak: ${"%.1f".format(telemetry.truePeakDbfs)} dBFS", color = Color(0xFF38BDF8), fontSize = 13.sp)
+                    Text(
+                        "Integrated Loudness: ${String.format(Locale.US, "%.1f", telemetry.lufs)} LUFS",
+                        color = Color(0xFFE2E8F0),
+                        fontSize = 13.sp,
+                    )
+                    Text(
+                        "True-Peak: ${String.format(Locale.US, "%.1f", telemetry.truePeakDbfs)} dBFS",
+                        color = Color(0xFF38BDF8),
+                        fontSize = 13.sp,
+                    )
                 }
             }
             Spacer(Modifier.height(16.dp))

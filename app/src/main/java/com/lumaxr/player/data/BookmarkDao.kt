@@ -2,6 +2,7 @@ package com.lumaxr.player.data
 
 import androidx.room.Dao
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.PrimaryKey
@@ -10,7 +11,10 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.serialization.Serializable
 
 @Serializable
-@Entity(tableName = "video_bookmarks")
+@Entity(
+    tableName = "video_bookmarks",
+    indices = [Index(value = ["mediaUri"])],
+)
 data class VideoBookmarkEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val mediaUri: String,
@@ -63,17 +67,17 @@ data class AudioTrackEntity(
 @Entity(tableName = "waveform_cache")
 data class WaveformCacheEntity(
     @PrimaryKey val trackUri: String,
-    val peaksCsv: String, // Normalized [0..1] 120-bin amplitudes
+    val peaksCsv: String,
     val updatedAtMs: Long = System.currentTimeMillis(),
 )
 
 @Serializable
 @Entity(tableName = "device_eq_profiles")
 data class DeviceEqProfileEntity(
-    @PrimaryKey val deviceKey: String, // e.g., "SPEAKER_QUAD", "USB:Fiio_KA13", "BT:00:11:22"
+    @PrimaryKey val deviceKey: String,
     val displayName: String,
     val autoEqName: String = "Flat",
-    val bandGainsDbCsv: String = "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0", // 15-band PEQ
+    val bandGainsDbCsv: String = "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0",
     val preampDb: Float = 0f,
     val crossfeedEnabled: Boolean = false,
     val crossfeedStrength: Float = 0.35f,
@@ -85,8 +89,8 @@ data class DeviceEqProfileEntity(
 @Serializable
 @Entity(tableName = "lyrics_cache")
 data class LyricsCacheEntity(
-    @PrimaryKey val trackKey: String, // normalized "artist|title|durationSec"
-    val format: String, // "TTML", "ELRC", "LRC", "PLAIN"
+    @PrimaryKey val trackKey: String,
+    val format: String,
     val rawPayload: String,
     val provider: String,
     val offsetMs: Int = 0,
@@ -103,7 +107,10 @@ data class MusicPlaylistEntity(
 )
 
 @Serializable
-@Entity(tableName = "scrobble_queue")
+@Entity(
+    tableName = "scrobble_queue",
+    indices = [Index(value = ["sentLastFm"]), Index(value = ["sentListenBrainz"])],
+)
 data class ScrobbleQueueEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val artist: String,
@@ -141,7 +148,7 @@ interface BookmarkDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertBookmark(bookmark: VideoBookmarkEntity)
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertBookmarks(bookmarks: List<VideoBookmarkEntity>)
 
     @Query("DELETE FROM video_bookmarks WHERE id = :id")
@@ -236,6 +243,9 @@ interface ScrobbleQueueDao {
 
     @Query("UPDATE scrobble_queue SET sentListenBrainz = 1 WHERE id IN (:ids)")
     suspend fun markListenBrainzSent(ids: List<Long>)
+
+    @Query("DELETE FROM scrobble_queue WHERE sentLastFm = 1 AND sentListenBrainz = 1")
+    suspend fun pruneCompleted()
 }
 
 @Dao
@@ -243,11 +253,14 @@ interface ListeningStatsDao {
     @Insert
     suspend fun insertEvent(event: ListeningEventEntity)
 
-    @Insert
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertAll(events: List<ListeningEventEntity>)
 
     @Query("SELECT * FROM listening_events ORDER BY timestampMs DESC LIMIT 500")
     suspend fun getRecentEvents(): List<ListeningEventEntity>
+
+    @Query("SELECT * FROM listening_events ORDER BY timestampMs DESC")
+    suspend fun getAllEvents(): List<ListeningEventEntity>
 
     @Query("SELECT COALESCE(SUM(listenedMs), 0) FROM listening_events")
     fun observeTotalListenedMs(): Flow<Long>

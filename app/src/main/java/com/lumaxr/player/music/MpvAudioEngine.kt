@@ -6,6 +6,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.ln
 
 data class MpvAudioState(
     val isPlaying: Boolean = false,
@@ -15,46 +18,53 @@ data class MpvAudioState(
     val audioSessionId: Int = 0,
 )
 
-/**
- * Engine 2 (libmpv): Niche Hi-Res & Lossless Studio Audio Path.
- * Handles DSD (.dsf/.dff), Dolby TrueHD/MLP (.thd/.mlp/.mka), DTS/DTS-HD MA (.dts),
- * WavPack (.wv), Monkey's Audio (.ape), Musepack (.mpc), and .cue sheet virtual album tracks.
- * Configured with vid=no, gapless-audio=yes, audio-resample-filter-size=32, 64-bit float internal mixing,
- * and optional SOFA HRTF binaural downmix when system Spatializer is inactive.
- */
 class MpvAudioEngine(
-    private val context: Context,
+    context: Context,
     private val dspController: AudioDspController,
 ) : MPV.EventObserver {
 
-    private val configDir = File(context.filesDir, "mpv_audio_cfg").apply { mkdirs() }
-    private val cacheDir = File(context.cacheDir, "mpv_audio_cache").apply { mkdirs() }
+    private val appContext = context.applicationContext
+    private val configDir = File(appContext.filesDir, "mpv_audio_cfg").apply { mkdirs() }
+    private val cacheDir = File(appContext.cacheDir, "mpv_audio_cache").apply { mkdirs() }
 
+    private val lock = Any()
     private var mpv: MPV? = null
     private val _state = MutableStateFlow(MpvAudioState())
     val state: StateFlow<MpvAudioState> = _state.asStateFlow()
 
+    @Volatile
+    private var suppressNextEndFile = false
+
+    @Volatile
+    private var currentPitch = 1.0f
+
     var onTrackEnded: (() -> Unit)? = null
 
-    private fun ensureInitialized() {
-        if (mpv != null) return
-        val instance = MPV(context, configDir.absolutePath, cacheDir.absolutePath)
-        instance.nativeCreate(context)
-        instance.setOptionString("vid", "no")
-        instance.setOptionString("vo", "null")
-        instance.setOptionString("gapless-audio", "yes")
-        instance.setOptionString("audio-resample-filter-size", "32")
-        instance.setOptionString("audio-format", "floatp")
-        instance.setOptionString("replaygain", "track")
-        instance.setOptionString("replaygain-clip", "yes")
-        instance.setOptionString("keep-open", "no")
-        instance.nativeInit()
-        instance.initSession()
-        instance.addObserver(this)
-        instance.observeProperty("time-pos", MPV.mpvFormat.MPV_FORMAT_DOUBLE)
-        instance.observeProperty("duration", MPV.mpvFormat.MPV_FORMAT_DOUBLE)
-        instance.observeProperty("pause", MPV.mpvFormat.MPV_FORMAT_FLAG)
-        mpv = instance
+    private fun ensureInitializedLocked(): MPV? {
+        mpv?.let { return it }
+        val instance = MPV(appContext, configDir.absolutePath, cacheDir.absolutePath)
+        return try {
+            instance.nativeCreate(appContext)
+            instance.setOptionString("vid", "no")
+            instance.setOptionString("vo", "null")
+            instance.setOptionString("gapless-audio", "yes")
+            instance.setOptionString("audio-resample-filter-size", "32")
+            instance.setOptionString("audio-format", "floatp")
+            instance.setOptionString("replaygain", "track")
+            instance.setOptionString("replaygain-clip", "yes")
+            instance.setOptionString("keep-open", "no")
+            instance.nativeInit()
+            instance.initSession()
+            instance.addObserver(this)
+            instance.observeProperty("time-pos", MPV.mpvFormat.MPV_FORMAT_DOUBLE)
+            instance.observeProperty("duration", MPV.mpvFormat.MPV_FORMAT_DOUBLE)
+            instance.observeProperty("pause", MPV.mpvFormat.MPV_FORMAT_FLAG)
+            mpv = instance
+            instance
+        } catch (_: Throwable) {
+            runCatching { instance.nativeDestroy(); instance.close() }
+            null
+        }
     }
 
     fun playUri(
@@ -64,53 +74,72 @@ class MpvAudioEngine(
         useSofaHrtf: Boolean = false,
         replayGainMode: ReplayGainMode = ReplayGainMode.TRACK,
     ) {
-        ensureInitialized()
-        val m = mpv ?: return
-        m.setPropertyString(
-            "replaygain",
-            when (replayGainMode) {
-                ReplayGainMode.OFF -> "no"
-                ReplayGainMode.ALBUM -> "album"
-                else -> "track"
-            },
-        )
-        val lavfi = dspController.buildMpvLavfiChain()
-        val sofaFilter = if (useSofaHrtf) "sofalizer" else ""
-        val combined = listOf(lavfi, sofaFilter).filter { it.isNotBlank() }.joinToString(",")
-        m.setPropertyString("af", if (combined.isNotBlank()) "lavfi=[$combined]" else "")
-        m.setPropertyString("start", if (startMs > 0L) (startMs / 1000.0).toString() else "none")
-        m.setPropertyString("end", if (endMs > 0L) (endMs / 1000.0).toString() else "none")
-        m.command("loadfile", uri)
-        _state.value = _state.value.copy(isPlaying = true)
+        synchronized(lock) {
+            val m = ensureInitializedLocked() ?: return
+            suppressNextEndFile = _state.value.isPlaying
+            m.setPropertyString(
+                "replaygain",
+                when (replayGainMode) {
+                    ReplayGainMode.OFF -> "no"
+                    ReplayGainMode.ALBUM -> "album"
+                    else -> "track"
+                },
+            )
+            applyCombinedAfLocked(m, useSofaHrtf)
+            m.setPropertyString("start", if (startMs > 0L) String.format(Locale.US, "%.3f", startMs / 1000.0) else "none")
+            m.setPropertyString("end", if (endMs > 0L) String.format(Locale.US, "%.3f", endMs / 1000.0) else "none")
+            _state.value = _state.value.copy(isPlaying = true, positionMs = 0L, durationMs = 0L)
+            m.command("loadfile", uri)
+        }
     }
 
     fun setPaused(paused: Boolean) {
-        mpv?.setPropertyBoolean("pause", paused)
-        _state.value = _state.value.copy(isPlaying = !paused)
+        synchronized(lock) {
+            mpv?.setPropertyBoolean("pause", paused)
+            _state.value = _state.value.copy(isPlaying = !paused)
+        }
     }
 
     fun seekToMs(ms: Long) {
-        mpv?.command("seek", (ms.coerceAtLeast(0L) / 1000.0).toString(), "absolute")
+        synchronized(lock) {
+            mpv?.command("seek", String.format(Locale.US, "%.3f", ms.coerceAtLeast(0L) / 1000.0), "absolute")
+        }
     }
 
     fun setVolume(vol: Float) {
-        mpv?.setPropertyDouble("volume", (vol.coerceIn(0f, 1f) * 100.0))
+        synchronized(lock) {
+            mpv?.setPropertyDouble("volume", vol.coerceIn(0f, 1f) * 100.0)
+        }
     }
 
-    fun setSpeedAndPitch(speed: Float, pitch: Float) {
-        mpv?.setPropertyDouble("speed", speed.coerceIn(0.5f, 2.0f).toDouble())
-        val semi = 12.0 * kotlin.math.ln(pitch.coerceIn(0.5f, 2.0f).toDouble()) / kotlin.math.ln(2.0)
-        if (kotlin.math.abs(semi) > 0.05) {
-            mpv?.setPropertyString("af", "rubberband=pitch-scale=${"%.3f".format(pitch)}")
+    fun setSpeedAndPitch(speed: Float, pitch: Float, useSofaHrtf: Boolean = false) {
+        synchronized(lock) {
+            currentPitch = pitch.coerceIn(0.5f, 2.0f)
+            val m = mpv ?: return
+            m.setPropertyDouble("speed", speed.coerceIn(0.5f, 2.0f).toDouble())
+            applyCombinedAfLocked(m, useSofaHrtf)
         }
     }
 
     fun refreshLavfiChain(useSofaHrtf: Boolean) {
-        val m = mpv ?: return
+        synchronized(lock) {
+            val m = mpv ?: return
+            applyCombinedAfLocked(m, useSofaHrtf)
+        }
+    }
+
+    private fun applyCombinedAfLocked(m: MPV, useSofaHrtf: Boolean) {
         val lavfi = dspController.buildMpvLavfiChain()
         val sofa = if (useSofaHrtf) "sofalizer" else ""
-        val combined = listOf(lavfi, sofa).filter { it.isNotBlank() }.joinToString(",")
-        m.setPropertyString("af", if (combined.isNotBlank()) "lavfi=[$combined]" else "")
+        val semi = 12.0 * ln(currentPitch.toDouble()) / ln(2.0)
+        val pitchFilter = if (abs(semi) > 0.05) String.format(Locale.US, "rubberband=pitch-scale=%.3f", currentPitch) else ""
+
+        val lavfiParts = listOf(lavfi, sofa).filter { it.isNotBlank() }.joinToString(",")
+        val combined = listOfNotNull(
+            lavfiParts.takeIf { it.isNotBlank() }?.let { "lavfi=[$it]" },
+            pitchFilter.takeIf { it.isNotBlank() },
+        ).joinToString(",")
+        m.setPropertyString("af", combined)
     }
 
     override fun eventProperty(property: String) {}
@@ -133,25 +162,39 @@ class MpvAudioEngine(
 
     override fun event(eventId: Int, data: is.xyz.mpv.MPVNode) {
         if (eventId == MPV.mpvEvent.MPV_EVENT_END_FILE) {
-            _state.value = _state.value.copy(isPlaying = false)
-            onTrackEnded?.invoke()
+            if (suppressNextEndFile) {
+                suppressNextEndFile = false
+                return
+            }
+            val reason = runCatching { data["reason"]?.asString() }.getOrNull()
+            if (reason == null || reason == "eof") {
+                _state.value = _state.value.copy(isPlaying = false)
+                onTrackEnded?.invoke()
+            }
         }
     }
 
     fun stop() {
-        mpv?.command("stop")
-        _state.value = _state.value.copy(isPlaying = false)
+        synchronized(lock) {
+            suppressNextEndFile = true
+            mpv?.command("stop")
+            _state.value = _state.value.copy(isPlaying = false, positionMs = 0L, durationMs = 0L)
+        }
     }
 
     fun release() {
-        mpv?.let {
-            runCatching {
-                it.removeObserver(this)
-                it.destroySession()
-                it.nativeDestroy()
-                it.close()
+        synchronized(lock) {
+            suppressNextEndFile = true
+            mpv?.let {
+                runCatching {
+                    it.removeObserver(this)
+                    it.destroySession()
+                    it.nativeDestroy()
+                    it.close()
+                }
             }
+            mpv = null
+            _state.value = MpvAudioState()
         }
-        mpv = null
     }
 }

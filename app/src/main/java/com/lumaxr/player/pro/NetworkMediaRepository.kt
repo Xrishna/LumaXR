@@ -7,12 +7,16 @@ import com.hierynomus.security.jce.JceSecurityProvider
 import com.hierynomus.smbj.SMBClient
 import com.hierynomus.smbj.SmbConfig
 import com.hierynomus.smbj.auth.AuthenticationContext
+import com.hierynomus.smbj.connection.Connection
+import com.hierynomus.smbj.session.Session
 import com.hierynomus.smbj.share.DiskShare
+import com.hierynomus.smbj.share.File as SmbFile
 import com.thegrizzlylabs.sardineandroid.impl.OkHttpSardine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.bouncycastle.jce.provider.BouncyCastleProvider
@@ -49,10 +53,6 @@ data class RemoteMediaEntry(
     val jellyfinItemId: String? = null,
 )
 
-/**
- * Native clients for SMB v2/v3 (smbj + BouncyCastle MD4), WebDAV (OkHttpSardine),
- * HTTP/FTP, and Jellyfin / Emby / Plex media servers.
- */
 class NetworkMediaRepository(
     private val chunkCache: RangeChunkCache,
     private val httpClient: OkHttpClient = OkHttpClient(),
@@ -84,30 +84,48 @@ class NetworkMediaRepository(
         withContext(Dispatchers.IO) {
             when (server.protocol) {
                 NetworkProtocol.SMB -> {
-                    val client = buildSmbClient()
-                    val conn = client.connect(server.hostOrUrl)
-                    val auth = AuthenticationContext(server.username, server.passwordOrToken.toCharArray(), null)
-                    val session = conn.authenticate(auth)
-                    val share = session.connectShare(server.shareOrLibrary) as DiskShare
-                    val file = share.openFile(
-                        entry.path.trimStart('/'),
-                        EnumSet.of(AccessMask.GENERIC_READ),
-                        null,
-                        SMB2ShareAccess.ALL,
-                        SMB2CreateDisposition.FILE_OPEN,
-                        null,
-                    )
-                    val totalSize = file.fileInformation.standardInformation.endOfFile
-                    val source = object : RandomAccessByteSource {
-                        override val totalLength: Long = totalSize
-                        override fun readAt(offset: Long, buffer: ByteArray, length: Int): Int {
-                            return file.read(buffer, offset, 0, length)
+                    var client: SMBClient? = null
+                    var conn: Connection? = null
+                    var session: Session? = null
+                    var share: DiskShare? = null
+                    var file: SmbFile? = null
+                    try {
+                        client = buildSmbClient()
+                        conn = client.connect(server.hostOrUrl)
+                        val auth = AuthenticationContext(server.username, server.passwordOrToken.toCharArray(), null)
+                        session = conn.authenticate(auth)
+                        share = session.connectShare(server.shareOrLibrary) as DiskShare
+                        file = share.openFile(
+                            entry.path.trimStart('/'),
+                            EnumSet.of(AccessMask.GENERIC_READ),
+                            null,
+                            SMB2ShareAccess.ALL,
+                            SMB2CreateDisposition.FILE_OPEN,
+                            null,
+                        )
+                        val totalSize = file.fileInformation.standardInformation.endOfFile
+                        val source = object : RandomAccessByteSource {
+                            override val totalLength: Long = totalSize
+                            override fun readAt(offset: Long, buffer: ByteArray, length: Int): Int {
+                                return file.read(buffer, offset, 0, length)
+                            }
+                            override fun close() {
+                                runCatching { file.close() }
+                                runCatching { share.close() }
+                                runCatching { session.close() }
+                                runCatching { conn.close() }
+                                runCatching { client.close() }
+                            }
                         }
-                        override fun close() {
-                            runCatching { file.close(); share.close(); session.close(); conn.close(); client.close() }
-                        }
+                        chunkCache.startLoopbackProxy("smb_${server.id}_${entry.path}", source)
+                    } catch (t: Throwable) {
+                        runCatching { file?.close() }
+                        runCatching { share?.close() }
+                        runCatching { session?.close() }
+                        runCatching { conn?.close() }
+                        runCatching { client?.close() }
+                        throw t
                     }
-                    chunkCache.startLoopbackProxy("smb_${server.id}_${entry.path}", source)
                 }
                 NetworkProtocol.JELLYFIN, NetworkProtocol.EMBY -> {
                     val base = server.hostOrUrl.trimEnd('/')
@@ -128,18 +146,19 @@ class NetworkMediaRepository(
                 client.connect(server.hostOrUrl).use { conn ->
                     val auth = AuthenticationContext(server.username, server.passwordOrToken.toCharArray(), null)
                     conn.authenticate(auth).use { session ->
-                        val share = session.connectShare(server.shareOrLibrary) as DiskShare
-                        val clean = path.trim('/')
-                        share.list(clean).filter { it.fileName != "." && it.fileName != ".." }.map { info ->
-                            val isDir = (info.fileAttributes and 0x10L) != 0L
-                            val child = if (clean.isEmpty()) info.fileName else "$clean/${info.fileName}"
-                            RemoteMediaEntry(
-                                id = child,
-                                name = info.fileName,
-                                path = child,
-                                isDirectory = isDir,
-                                sizeBytes = info.endOfFile,
-                            )
+                        (session.connectShare(server.shareOrLibrary) as DiskShare).use { share ->
+                            val clean = path.trim('/')
+                            share.list(clean).filter { it.fileName != "." && it.fileName != ".." }.map { info ->
+                                val isDir = (info.fileAttributes and 0x10L) != 0L
+                                val child = if (clean.isEmpty()) info.fileName else "$clean/${info.fileName}"
+                                RemoteMediaEntry(
+                                    id = child,
+                                    name = info.fileName,
+                                    path = child,
+                                    isDirectory = isDir,
+                                    sizeBytes = info.endOfFile,
+                                )
+                            }
                         }
                     }
                 }
@@ -149,21 +168,22 @@ class NetworkMediaRepository(
 
     private fun listWebDav(server: NetworkServerConfig, path: String): List<RemoteMediaEntry> {
         return runCatching {
-            val sardine = OkHttpSardine()
+            val sardine = OkHttpSardine(httpClient)
             if (server.username.isNotBlank()) {
                 sardine.setCredentials(server.username, server.passwordOrToken)
             }
             val targetUrl = "${server.hostOrUrl.trimEnd('/')}/${path.trimStart('/')}"
             val resources = sardine.list(targetUrl)
-            // Strip self-href (first entry returned by WebDAV 207 Multi-Status PROPFIND)
             resources.drop(1).map { res ->
+                val resolved = targetUrl.toHttpUrlOrNull()?.resolve(res.path)?.toString()
+                    ?: "${server.hostOrUrl.trimEnd('/')}/${res.path.trimStart('/')}"
                 RemoteMediaEntry(
                     id = res.path,
                     name = res.name,
                     path = res.path,
                     isDirectory = res.isDirectory,
                     sizeBytes = res.contentLength ?: 0L,
-                    streamUrl = "${server.hostOrUrl.trimEnd('/')}/${res.path.trimStart('/')}",
+                    streamUrl = resolved,
                 )
             }
         }.getOrDefault(emptyList())
@@ -177,13 +197,15 @@ class NetworkMediaRepository(
 
     private fun listJellyfinOrEmby(server: NetworkServerConfig, parentId: String): List<RemoteMediaEntry> {
         val base = server.hostOrUrl.trimEnd('/')
-        val url = if (parentId.isBlank()) {
-            "$base/Items?Recursive=false"
+        val baseUrl = base.toHttpUrlOrNull() ?: return emptyList()
+        val urlBuilder = baseUrl.newBuilder().addPathSegment("Items")
+        if (parentId.isBlank()) {
+            urlBuilder.addQueryParameter("Recursive", "false")
         } else {
-            "$base/Items?ParentId=$parentId"
+            urlBuilder.addQueryParameter("ParentId", parentId)
         }
         val req = Request.Builder()
-            .url(url)
+            .url(urlBuilder.build())
             .header("X-Emby-Token", server.passwordOrToken)
             .build()
         return runCatching {
@@ -204,9 +226,25 @@ class NetworkMediaRepository(
         }.getOrDefault(emptyList())
     }
 
+    @Serializable
+    private data class PlexMediaContainer(val Directory: List<PlexDir> = emptyList(), val Metadata: List<PlexMeta> = emptyList())
+
+    @Serializable
+    private data class PlexDir(val key: String = "", val title: String = "")
+
+    @Serializable
+    private data class PlexMeta(val key: String = "", val title: String = "", val type: String = "")
+
+    @Serializable
+    private data class PlexWrapper(val MediaContainer: PlexMediaContainer = PlexMediaContainer())
+
     private fun listPlex(server: NetworkServerConfig, key: String): List<RemoteMediaEntry> {
         val base = server.hostOrUrl.trimEnd('/')
-        val path = key.ifBlank { "/library/sections" }
+        val path = when {
+            key.isBlank() -> "/library/sections"
+            key.startsWith("/") -> key
+            else -> "/library/sections/$key/all"
+        }
         val req = Request.Builder()
             .url("$base$path")
             .header("X-Plex-Token", server.passwordOrToken)
@@ -214,29 +252,38 @@ class NetworkMediaRepository(
             .build()
         return runCatching {
             httpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) emptyList() else listOf(
-                    RemoteMediaEntry("plex_root", "Plex Library", path, isDirectory = true),
-                )
+                if (!resp.isSuccessful) return@use emptyList()
+                val dto = json.decodeFromString<PlexWrapper>(resp.body?.string().orEmpty())
+                val dirs = dto.MediaContainer.Directory.map {
+                    RemoteMediaEntry(it.key, it.title, it.key, isDirectory = true)
+                }
+                val metas = dto.MediaContainer.Metadata.map {
+                    RemoteMediaEntry(it.key, it.title, it.key, isDirectory = it.type != "movie" && it.type != "episode")
+                }
+                dirs + metas
             }
         }.getOrDefault(emptyList())
     }
 
     private fun listHttpDirectory(server: NetworkServerConfig, path: String): List<RemoteMediaEntry> {
-        val url = "${server.hostOrUrl.trimEnd('/')}/${path.trimStart('/')}"
-        val req = Request.Builder().url(url).build()
+        val baseUrl = "${server.hostOrUrl.trimEnd('/')}/${path.trimStart('/')}".toHttpUrlOrNull() ?: return emptyList()
+        val req = Request.Builder().url(baseUrl).build()
         return runCatching {
             httpClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@use emptyList()
                 val html = resp.body?.string().orEmpty()
                 Regex("""href="([^"]+)"""").findAll(html).mapNotNull { m ->
                     val href = m.groupValues[1]
-                    if (href.startsWith("?") || href == "../") return@mapNotNull null
+                    if (href.startsWith("?") || href.startsWith("#") || href.startsWith("mailto:", true) || href == "../") {
+                        return@mapNotNull null
+                    }
+                    val resolved = baseUrl.resolve(href)?.toString() ?: return@mapNotNull null
                     RemoteMediaEntry(
                         id = href,
                         name = href.trimEnd('/').substringAfterLast('/'),
                         path = href,
                         isDirectory = href.endsWith("/"),
-                        streamUrl = "$url/${href.trimStart('/')}",
+                        streamUrl = resolved,
                     )
                 }.toList()
             }

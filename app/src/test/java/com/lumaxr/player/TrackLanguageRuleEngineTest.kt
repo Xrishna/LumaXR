@@ -35,4 +35,15 @@ class TrackLanguageRuleEngineTest {
         assertThat(rec.audioTrackId).isEqualTo(2)
         assertThat(rec.subtitleTrackId).isNull()
     }
+
+    @Test
+    fun matchesIso639TwoLetterJaTagForJapaneseRule() {
+        val rule = engine.defaultRuleForFolder("/storage/emulated/0/Movies/Anime/Ghibli")
+        val tracks = listOf(
+            MediaStreamTrack(1, "audio", "en", "English", "aac"),
+            MediaStreamTrack(2, "audio", "ja", "Japanese", "flac"),
+        )
+        val rec = engine.selectTracks(tracks, rule)
+        assertThat(rec.audioTrackId).isEqualTo(2)
+    }
 }

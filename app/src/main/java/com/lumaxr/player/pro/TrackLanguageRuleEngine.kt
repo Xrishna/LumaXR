@@ -1,10 +1,11 @@
 package com.lumaxr.player.pro
 
 import com.lumaxr.player.data.FolderVideoConfigEntity
+import java.util.Locale
 
 data class MediaStreamTrack(
     val id: Int,
-    val type: String, // "audio" or "sub"
+    val type: String,
     val lang: String,
     val title: String,
     val codec: String,
@@ -13,18 +14,29 @@ data class MediaStreamTrack(
 
 data class TrackSelectionRecommendation(
     val audioTrackId: Int?,
-    val subtitleTrackId: Int?, // null or -1 means disable subs
+    val subtitleTrackId: Int?,
 )
 
-/**
- * Per-Series / Per-Folder Smart Track Selection Engine:
- * - Anime folders: Japanese audio (`jpn`/`ja`) + English ASS Signs/Songs or full dialogue
- * - UHD Remux folders: English Atmos/TrueHD (`eng`/`en`) + no forced subs unless specified
- */
 class TrackLanguageRuleEngine {
 
+    companion object {
+        private val ISO_SYNONYMS = mapOf(
+            "ja" to "jpn", "jpn" to "jpn",
+            "en" to "eng", "eng" to "eng",
+            "zh" to "zho", "zho" to "zho", "chi" to "zho",
+            "de" to "deu", "deu" to "deu", "ger" to "deu",
+            "fr" to "fra", "fra" to "fra", "fre" to "fra",
+            "es" to "spa", "spa" to "spa",
+            "pt" to "por", "por" to "por",
+            "ko" to "kor", "kor" to "kor",
+            "it" to "ita", "ita" to "ita",
+            "ru" to "rus", "rus" to "rus",
+            "hi" to "hin", "hin" to "hin",
+        )
+    }
+
     fun defaultRuleForFolder(folderPath: String): FolderVideoConfigEntity {
-        val lower = folderPath.lowercase()
+        val lower = folderPath.lowercase(Locale.ROOT)
         return when {
             "anime" in lower -> FolderVideoConfigEntity(
                 scopeKey = folderPath,
@@ -69,7 +81,11 @@ class TrackLanguageRuleEngine {
             val langMatches = subTracks.filter { matchesLang(it.lang, rule.preferredSubtitleLang) }
             if (rule.preferAssSignsSongs) {
                 langMatches.firstOrNull {
-                    it.codec.contains("ass", true) || "sign" in it.title.lowercase() || "song" in it.title.lowercase()
+                    val t = it.title.lowercase(Locale.ROOT)
+                    ("sign" in t || "song" in t) && it.codec.contains("ass", true)
+                } ?: langMatches.firstOrNull {
+                    val t = it.title.lowercase(Locale.ROOT)
+                    it.codec.contains("ass", true) || "sign" in t || "song" in t
                 } ?: langMatches.firstOrNull()
             } else {
                 langMatches.firstOrNull { !it.isForced } ?: langMatches.firstOrNull()
@@ -83,7 +99,7 @@ class TrackLanguageRuleEngine {
     }
 
     private fun scoreAudioCodec(codec: String): Int {
-        val c = codec.lowercase()
+        val c = codec.lowercase(Locale.ROOT)
         return when {
             "truehd" in c || "mlp" in c -> 100
             "eac3" in c || "atmos" in c -> 90
@@ -94,9 +110,14 @@ class TrackLanguageRuleEngine {
         }
     }
 
+    private fun normalizeLang(code: String): String {
+        val base = code.lowercase(Locale.ROOT).trim().substringBefore('-').substringBefore('_')
+        return ISO_SYNONYMS[base] ?: base
+    }
+
     private fun matchesLang(trackLang: String, preferred: String): Boolean {
-        val a = trackLang.lowercase().take(2)
-        val b = preferred.lowercase().take(2)
+        val a = normalizeLang(trackLang)
+        val b = normalizeLang(preferred)
         return a.isNotBlank() && a == b
     }
 }

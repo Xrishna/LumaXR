@@ -1,5 +1,5 @@
 //!DESC LumaXR hdr-toys Modular Tone & Gamut Pipeline (BT.2446a / BT.2390 / ST.2094 / Astra)
-//!HOOK MAIN
+//!HOOK LINEAR
 //!BIND HOOKED
 //!PARAM u_tm_mode
 //!TYPE int
@@ -22,27 +22,47 @@
 //!MAXIMUM 1.0
 0.35
 
-// u_tm_mode: 0=off/passthrough, 1=bt2446a, 2=bt2390, 3=bt1886, 4=st2094-40/50, 5=astra
-
 const vec3 L_2020 = vec3(0.2627, 0.6780, 0.0593);
 
-float bt2390_eetf(float e, float lw, float lmax) {
-    float ks = 1.5 * (lmax / max(lw, 1e-4)) - 0.5;
-    ks = clamp(ks, 0.1, 0.95);
-    if (e < ks) return e;
-    float t = (e - ks) / max(1.0 - ks, 1e-4);
-    float t2 = t * t;
-    float t3 = t2 * t;
-    float p = (2.0 * t3 - 3.0 * t2 + 1.0) * ks
-            + (t3 - 2.0 * t2 + t) * (1.0 - ks)
-            + (-2.0 * t3 + 3.0 * t2) * (lmax / max(lw, 1e-4));
-    return p;
+float lin_to_pq(float x) {
+    float c = pow(max(x, 0.0), 0.1593017578);
+    return pow((0.8359375 + 18.8515625 * c) / (1.0 + 18.6875 * c), 78.84375);
+}
+
+float pq_to_lin(float e) {
+    float p = pow(clamp(e, 0.0, 1.0), 1.0 / 78.84375);
+    float num = max(p - 0.8359375, 0.0);
+    float den = max(18.8515625 - 18.6875 * p, 1e-5);
+    return pow(num / den, 1.0 / 0.1593017578);
+}
+
+float bt2390_eetf(float y_rel, float lw, float lmax) {
+    if (lmax >= lw) return y_rel;
+    float e_src = lin_to_pq(clamp(y_rel * (lw / 10000.0), 0.0, 1.0));
+    float pq_max = lin_to_pq(lmax / 10000.0);
+    float pq_src = lin_to_pq(lw / 10000.0);
+    float e = clamp(e_src / max(pq_src, 1e-4), 0.0, 1.0);
+    float max_lum = clamp(pq_max / max(pq_src, 1e-4), 0.05, 1.0);
+    float ks = clamp(1.5 * max_lum - 0.5, 0.1, 0.92);
+    float e_out;
+    if (e < ks) {
+        e_out = e;
+    } else {
+        float t = (e - ks) / max(1.0 - ks, 1e-4);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        e_out = (2.0 * t3 - 3.0 * t2 + 1.0) * ks
+              + (t3 - 2.0 * t2 + t) * (1.0 - ks)
+              + (-2.0 * t3 + 3.0 * t2) * max_lum;
+    }
+    return pq_to_lin(e_out * pq_src) * (10000.0 / max(lw, 1.0));
 }
 
 float bt2446a_tm(float y_rel, float src_peak, float dst_peak) {
+    if (dst_peak >= src_peak) return y_rel;
     float phdr = 1.0 + 32.0 * pow(src_peak / 10000.0, 1.0 / 2.4);
     float psdr = 1.0 + 32.0 * pow(dst_peak / 10000.0, 1.0 / 2.4);
-    float yp = pow(max(y_rel, 0.0), 1.0 / 2.4);
+    float yp = pow(clamp(y_rel, 0.0, 1.0), 1.0 / 2.4);
     float y_log = log(1.0 + (phdr - 1.0) * yp) / max(log(phdr), 1e-4);
     float yc;
     if (y_log <= 0.7399) {
@@ -58,9 +78,8 @@ float bt2446a_tm(float y_rel, float src_peak, float dst_peak) {
 
 vec4 hook() {
     vec4 color = HOOKED_texOff(0.0);
-    if (u_tm_mode == 0) {
-        return color;
-    }
+    if (u_tm_mode == 0) return color;
+
     vec3 rgb = max(color.rgb, vec3(0.0));
     float y = dot(rgb, L_2020);
     if (y <= 1e-6) return color;
@@ -73,18 +92,17 @@ vec4 hook() {
     } else if (u_tm_mode == 3) {
         y_out = pow(clamp(y, 0.0, 1.0), 2.4 / 2.2);
     } else if (u_tm_mode == 4) {
-        // ST 2094-40 / 50 dynamic knee compression
-        float ratio = u_dst_peak / max(u_src_peak, 1.0);
+        float ratio = clamp(u_dst_peak / max(u_src_peak, 1.0), 0.1, 1.0);
         float knee = clamp(0.65 * ratio + 0.25, 0.35, 0.88);
-        y_out = y <= knee ? y : knee + (1.0 - knee) * tanh((y - knee) / max(1.0 - knee, 1e-4));
+        y_out = y <= knee ? y : knee + (ratio - knee) * tanh((y - knee) / max(1.0 - knee, 1e-4));
     } else if (u_tm_mode == 5) {
-        // Astra perceptual highlight saturation preservation
-        float base = bt2446a_tm(y, u_src_peak, u_dst_peak);
-        y_out = mix(y, base, 0.85);
+        y_out = mix(y, bt2446a_tm(y, u_src_peak, u_dst_peak), 0.85);
         vec3 chroma = rgb - vec3(y);
         rgb = vec3(y) + chroma * (1.0 - u_astra_strength * smoothstep(0.6, 1.0, y));
     }
 
-    float scale = y_out / max(y, 1e-6);
-    return vec4(clamp(rgb * scale, 0.0, 1.0), color.a);
+    vec3 out_rgb = rgb * (y_out / max(y, 1e-6));
+    float peak_c = max(out_rgb.r, max(out_rgb.g, out_rgb.b));
+    if (peak_c > 1.0) out_rgb /= peak_c;
+    return vec4(max(out_rgb, vec3(0.0)), color.a);
 }

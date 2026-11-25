@@ -28,6 +28,7 @@ import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -36,6 +37,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,7 +59,7 @@ fun VideoLibraryScreen(
     onOpenVideo: (VideoLibraryItem) -> Unit,
 ) {
     val videos by viewModel.videos.collectAsState()
-    var streamUrlInput by remember { mutableStateOf("") }
+    var streamUrlInput by rememberSaveable { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -78,17 +80,18 @@ fun VideoLibraryScreen(
                 modifier = Modifier.weight(1f),
             )
             Button(
+                enabled = streamUrlInput.isNotBlank(),
                 onClick = {
                     val url = streamUrlInput.trim()
                     if (url.isNotEmpty()) {
                         onOpenVideo(
                             VideoLibraryItem(
                                 uri = url,
-                                title = url.substringAfterLast('/'),
+                                title = url.substringAfterLast('/').ifBlank { "Stream" },
                                 folderPath = "",
                                 durationMs = 0L,
-                                width = 3840,
-                                height = 2160,
+                                width = 0,
+                                height = 0,
                                 sizeBytes = 0L,
                             ),
                         )
@@ -106,9 +109,15 @@ fun VideoLibraryScreen(
 
         if (videos.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
                     Icon(Icons.Default.Movie, contentDescription = null, tint = Color(0xFF475569), modifier = Modifier.padding(8.dp))
                     Text("No local videos found yet. Grant storage permission or paste a stream URL above.", color = Color(0xFF94A3B8))
+                    OutlinedButton(onClick = { viewModel.refreshMediaLibraries() }) {
+                        Text("Rescan Libraries")
+                    }
                 }
             }
         } else {
@@ -195,8 +204,17 @@ private fun VideoHeroCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                     Spacer(Modifier.height(4.dp))
+                    val subtitle = buildString {
+                        if (item.width > 0 && item.height > 0) append("${item.width}×${item.height}")
+                        val folder = item.folderPath.substringAfterLast('/')
+                        if (folder.isNotBlank()) {
+                            if (isNotEmpty()) append(" • ")
+                            append(folder)
+                        }
+                        if (isEmpty()) append("Stream URL")
+                    }
                     Text(
-                        text = "${item.width}×${item.height} • ${item.folderPath.substringAfterLast('/')}",
+                        text = subtitle,
                         color = Color(0xFF94A3B8),
                         fontSize = 12.sp,
                         maxLines = 1,

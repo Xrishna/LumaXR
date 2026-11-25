@@ -13,13 +13,18 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
@@ -41,6 +46,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -49,7 +55,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -58,6 +63,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -71,11 +77,12 @@ import com.lumaxr.player.video.DesktopShortcutCallbacks
 import com.lumaxr.player.video.EngineSwitchPreference
 import com.lumaxr.player.video.HdrToysToneMapper
 import com.lumaxr.player.video.SubtitlePlacement
+import com.lumaxr.player.video.VideoEngineKind
 import com.lumaxr.player.video.XrPreset
-import kotlinx.coroutines.launch
 import java.io.File
+import java.util.Locale
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun VideoPlayerScreen(
     uri: String,
@@ -88,7 +95,6 @@ fun VideoPlayerScreen(
 ) {
     val context = LocalContext.current
     val activity = context as? Activity
-    val scope = rememberCoroutineScope()
     val coordinator = viewModel.container.videoCoordinator
 
     val xrPreset by viewModel.xrPreset.collectAsState()
@@ -101,6 +107,8 @@ fun VideoPlayerScreen(
 
     val hudTelemetry by coordinator.hudTelemetry.collectAsState()
     val mpvTelemetry by coordinator.mpvEngine.telemetry.collectAsState()
+    val media3Telemetry by coordinator.media3Engine.telemetry.collectAsState()
+    val activeEngine by coordinator.activeEngineKind.collectAsState()
 
     var showHud by remember { mutableStateOf(true) }
     var showMasteringSheet by remember { mutableStateOf(false) }
@@ -110,6 +118,7 @@ fun VideoPlayerScreen(
     var subPlacement by remember { mutableStateOf(SubtitlePlacement.ABOVE_LETTERBOX) }
     var abLoopA by remember { mutableStateOf<Double?>(null) }
     var surfaceViewRef by remember { mutableStateOf<SurfaceView?>(null) }
+    var playbackStarted by remember(uri, enginePref, experimentalHbm, refreshPolicy) { mutableStateOf(false) }
 
     // True HyperOS 3 edge-to-edge immersive mode
     DisposableEffect(activity) {
@@ -122,8 +131,16 @@ fun VideoPlayerScreen(
         }
     }
 
-    LaunchedEffect(surfaceViewRef, uri, xrPreset, enginePref, hdrToysMapper, experimentalHbm, refreshPolicy) {
+    // Guarantee engine + display cleanup even when exited via NavDisplay pop or PredictiveBackStyle.NONE
+    DisposableEffect(uri) {
+        onDispose {
+            coordinator.stopAndRestoreDisplay()
+        }
+    }
+
+    LaunchedEffect(surfaceViewRef, uri, enginePref, experimentalHbm, refreshPolicy) {
         val sv = surfaceViewRef ?: return@LaunchedEffect
+        playbackStarted = false
         coordinator.startPlayback(
             surfaceView = sv,
             uri = uri,
@@ -134,7 +151,34 @@ fun VideoPlayerScreen(
             hdrToysMapper = hdrToysMapper,
             subtitlePeakNits = subtitlePeakNits,
         )
+        playbackStarted = true
     }
+
+    LaunchedEffect(playbackStarted, xrPreset, hdrToysMapper, subtitlePeakNits) {
+        if (playbackStarted) {
+            coordinator.updateLiveMasteringOptions(
+                preset = xrPreset,
+                hdrToysMapper = hdrToysMapper,
+                subtitlePeakNits = subtitlePeakNits,
+            )
+        }
+    }
+
+    val isPausedNow = if (activeEngine == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+        mpvTelemetry.paused
+    } else {
+        !media3Telemetry.isPlaying
+    }
+    val posSecNow = if (activeEngine == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+        mpvTelemetry.positionSec
+    } else {
+        media3Telemetry.positionMs / 1000.0
+    }
+    val durSecNow = (if (activeEngine == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+        mpvTelemetry.durationSec
+    } else {
+        media3Telemetry.durationMs / 1000.0
+    }).coerceAtLeast(1.0)
 
     with(sharedScope) {
         val sharedState = rememberSharedContentState(key = "video_$uri")
@@ -149,7 +193,7 @@ fun VideoPlayerScreen(
                 )
                 .lumaDesktopShortcuts(
                     DesktopShortcutCallbacks(
-                        onTogglePlayPause = { coordinator.setPaused(!mpvTelemetry.paused) },
+                        onTogglePlayPause = { coordinator.setPaused(!coordinator.isPaused()) },
                         onSeekRelativeSec = { delta -> coordinator.seekRelative(delta) },
                         onToggleTelemetryPill = { viewModel.toggleTelemetryPill() },
                         onToggleDeband = { Toast.makeText(context, "Deband toggled", Toast.LENGTH_SHORT).show() },
@@ -214,7 +258,7 @@ fun VideoPlayerScreen(
                     Text(
                         text = "${hudTelemetry.engineLabel} • ${hudTelemetry.decoderLabel} • ${hudTelemetry.formatLabel} • " +
                             "${hudTelemetry.outputLabel} • ${hudTelemetry.refreshRateHz}Hz • " +
-                            "${"%.0f".format(hudTelemetry.physicalNits)}nit (${"%.2f".format(hudTelemetry.inverseGainX)}x) • " +
+                            "${String.format(Locale.US, "%.0f", hudTelemetry.physicalNits)}nit (${String.format(Locale.US, "%.2f", hudTelemetry.inverseGainX)}x) • " +
                             "${hudTelemetry.thermalTier.name} • Drops:${hudTelemetry.droppedFrames}",
                         color = Color(0xFFE2E8F0),
                         fontSize = 11.sp,
@@ -243,6 +287,8 @@ fun VideoPlayerScreen(
                             color = Color.White,
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 16.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
 
@@ -257,9 +303,12 @@ fun VideoPlayerScreen(
                             modifier = Modifier.pointerInput(Unit) {
                                 detectTapGestures(
                                     onPress = {
-                                        coordinator.setBypassOriginal(true)
-                                        tryAwaitRelease()
-                                        coordinator.setBypassOriginal(false)
+                                        try {
+                                            coordinator.setBypassOriginal(true)
+                                            tryAwaitRelease()
+                                        } finally {
+                                            coordinator.setBypassOriginal(false)
+                                        }
                                     },
                                 )
                             },
@@ -276,7 +325,7 @@ fun VideoPlayerScreen(
                             Icon(Icons.Default.Headphones, contentDescription = "Background Audio", tint = Color.White)
                         }
                         IconButton(onClick = {
-                            viewModel.addBookmark(uri, title, (mpvTelemetry.positionSec * 1000).toLong(), "Bookmark")
+                            viewModel.addBookmark(uri, title, (coordinator.currentPositionSec() * 1000).toLong(), "Bookmark")
                             Toast.makeText(context, "Timeline Bookmark Saved", Toast.LENGTH_SHORT).show()
                         }) {
                             Icon(Icons.Default.BookmarkAdd, contentDescription = "Bookmark", tint = Color.White)
@@ -302,12 +351,12 @@ fun VideoPlayerScreen(
                             .fillMaxWidth(),
                     ) {
                         Column(modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp)) {
-                            val dur = mpvTelemetry.durationSec.coerceAtLeast(1.0)
-                            val pos = mpvTelemetry.positionSec.coerceIn(0.0, dur)
+                            val dur = durSecNow
+                            val pos = posSecNow.coerceIn(0.0, dur)
                             Slider(
                                 value = (pos / dur).toFloat(),
                                 onValueChange = { frac ->
-                                    coordinator.mpvEngine.seekToSeconds(frac * dur)
+                                    coordinator.seekToSec(frac * dur)
                                 },
                             )
                             Row(
@@ -324,9 +373,9 @@ fun VideoPlayerScreen(
                                     IconButton(onClick = { coordinator.mpvEngine.frameStepBackward() }) {
                                         Icon(Icons.Default.SkipPrevious, contentDescription = "Frame Back", tint = Color.White)
                                     }
-                                    IconButton(onClick = { coordinator.setPaused(!mpvTelemetry.paused) }) {
+                                    IconButton(onClick = { coordinator.setPaused(!isPausedNow) }) {
                                         Icon(
-                                            imageVector = if (mpvTelemetry.paused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                            imageVector = if (isPausedNow) Icons.Default.PlayArrow else Icons.Default.Pause,
                                             contentDescription = "Play/Pause",
                                             tint = Color(0xFF38BDF8),
                                         )
@@ -378,9 +427,9 @@ fun VideoPlayerScreen(
                     text = { Text(if (abLoopA == null) "Set A-B Loop Point A" else "Set A-B Loop Point B") },
                     onClick = {
                         if (abLoopA == null) {
-                            abLoopA = mpvTelemetry.positionSec
+                            abLoopA = coordinator.currentPositionSec()
                         } else {
-                            coordinator.mpvEngine.setAbLoop(abLoopA, mpvTelemetry.positionSec)
+                            coordinator.mpvEngine.setAbLoop(abLoopA, coordinator.currentPositionSec())
                             abLoopA = null
                         }
                         showContextMenu = false
@@ -395,12 +444,18 @@ fun VideoPlayerScreen(
     }
 
     if (showMasteringSheet) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
         ModalBottomSheet(
             onDismissRequest = { showMasteringSheet = false },
+            sheetState = sheetState,
             containerColor = Color(0xFF0F172A),
         ) {
             Column(
-                modifier = Modifier.padding(20.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text("Cinema Mastering XR Studio", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
@@ -410,7 +465,7 @@ fun VideoPlayerScreen(
                 }
 
                 Text("XR Preset", color = Color(0xFFCBD5E1), fontSize = 13.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     XrPreset.entries.forEach { preset ->
                         FilterChip(
                             selected = xrPreset == preset,
@@ -421,7 +476,7 @@ fun VideoPlayerScreen(
                 }
 
                 Text("Engine Switch", color = Color(0xFFCBD5E1), fontSize = 13.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     EngineSwitchPreference.entries.forEach { pref ->
                         FilterChip(
                             selected = enginePref == pref,
@@ -448,7 +503,7 @@ fun VideoPlayerScreen(
                 )
 
                 Text("Subtitle Placement", color = Color(0xFFCBD5E1), fontSize = 13.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     SubtitlePlacement.entries.forEach { pl ->
                         FilterChip(
                             selected = subPlacement == pl,
@@ -471,5 +526,9 @@ private fun formatTimeSec(sec: Double): String {
     val h = total / 3600
     val m = (total % 3600) / 60
     val s = total % 60
-    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
+    return if (h > 0) {
+        String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+    } else {
+        String.format(Locale.US, "%02d:%02d", m, s)
+    }
 }

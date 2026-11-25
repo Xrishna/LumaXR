@@ -1,13 +1,16 @@
 package com.lumaxr.player.pro
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 
 enum class SegmentKind {
     INTRO,
@@ -25,13 +28,10 @@ data class MediaSegment(
 
 data class BifFrameEntry(
     val timestampMs: Long,
-    val offset: Int,
+    val offset: Long,
     val length: Int,
 )
 
-/**
- * Chapter & Intro/Recap/Credits Auto-Skipper + Jellyfin Trickplay / Roku BIF Storyboard Thumbnail Parser.
- */
 class ChapterAndIntroSkipper(
     private val httpClient: OkHttpClient = OkHttpClient(),
 ) {
@@ -49,12 +49,12 @@ class ChapterAndIntroSkipper(
     private data class JfSegmentsResponse(val Items: List<JfSegmentDto> = emptyList())
 
     fun classifyChapterTitle(title: String): SegmentKind? {
-        val t = title.trim().lowercase()
+        val t = title.trim().lowercase(Locale.ROOT)
         return when {
-            t == "op" || "opening" in t || "intro" in t -> SegmentKind.INTRO
-            "recap" in t || "previously" in t -> SegmentKind.RECAP
-            t == "ed" || "ending" in t || "credits" in t || "outro" in t -> SegmentKind.CREDITS
-            "preview" in t || "next episode" in t -> SegmentKind.PREVIEW
+            Regex("""\b(op|opening|intro)\b""").containsMatchIn(t) -> SegmentKind.INTRO
+            Regex("""\b(recap|previously)\b""").containsMatchIn(t) -> SegmentKind.RECAP
+            Regex("""\b(ed|ending|credits|outro)\b""").containsMatchIn(t) -> SegmentKind.CREDITS
+            Regex("""\b(preview|next episode)\b""").containsMatchIn(t) -> SegmentKind.PREVIEW
             else -> null
         }
     }
@@ -64,23 +64,27 @@ class ChapterAndIntroSkipper(
         itemId: String,
         apiKey: String,
     ): List<MediaSegment> = withContext(Dispatchers.IO) {
+        val url = serverBaseUrl.trimEnd('/').toHttpUrlOrNull()?.newBuilder()
+            ?.addPathSegment("MediaSegments")
+            ?.addPathSegment(itemId)
+            ?.build() ?: return@withContext emptyList()
+
         val req = Request.Builder()
-            .url("${serverBaseUrl.trimEnd('/')}/MediaSegments/$itemId")
+            .url(url)
             .header("X-Emby-Token", apiKey)
             .build()
-        runCatching {
+        try {
             httpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return@use emptyList()
+                if (!resp.isSuccessful) return@withContext emptyList()
                 val dto = json.decodeFromString<JfSegmentsResponse>(resp.body?.string().orEmpty())
                 dto.Items.map { seg ->
-                    val kind = when (seg.Type.lowercase()) {
+                    val kind = when (seg.Type.lowercase(Locale.ROOT)) {
                         "intro" -> SegmentKind.INTRO
                         "recap" -> SegmentKind.RECAP
                         "outro" -> SegmentKind.CREDITS
                         "preview" -> SegmentKind.PREVIEW
-                        else -> SegmentKind.INTRO
+                        else -> null
                     }
-                    // Jellyfin MediaSegments uses 10,000,000 ticks per second -> 10,000 ticks per ms
                     MediaSegment(
                         title = seg.Type,
                         startMs = seg.StartTicks / 10_000L,
@@ -89,12 +93,13 @@ class ChapterAndIntroSkipper(
                     )
                 }
             }
-        }.getOrDefault(emptyList())
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            emptyList()
+        }
     }
 
-    /**
-     * Parses Roku BIF binary storyboard index (magic bytes 0x89 'B' 'I' 'F').
-     */
     fun parseBifIndex(bytes: ByteArray): List<BifFrameEntry> {
         if (bytes.size < 64) return emptyList()
         if (bytes[0] != 0x89.toByte() || bytes[1] != 0x42.toByte() ||
@@ -104,15 +109,18 @@ class ChapterAndIntroSkipper(
         }
         val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         val count = buf.getInt(12).coerceIn(0, 20000)
-        val multiplierMs = buf.getInt(16).coerceAtLeast(1000)
+        val rawMultiplier = buf.getInt(16)
+        val multiplierMs = if (rawMultiplier <= 0) 1000L else rawMultiplier.toLong()
         val entries = mutableListOf<BifFrameEntry>()
         var pos = 64
         for (i in 0 until count) {
             if (pos + 16 > bytes.size) break
-            val ts = buf.getInt(pos).toLong() * multiplierMs.toLong()
-            val offset = buf.getInt(pos + 4)
-            val nextOffset = buf.getInt(pos + 12)
-            entries += BifFrameEntry(ts, offset, (nextOffset - offset).coerceAtLeast(0))
+            val ts = (buf.getInt(pos).toLong() and 0xFFFFFFFFL) * multiplierMs
+            val offset = buf.getInt(pos + 4).toLong() and 0xFFFFFFFFL
+            val nextOffset = buf.getInt(pos + 12).toLong() and 0xFFFFFFFFL
+            if (offset <= bytes.size.toLong() && nextOffset >= offset && nextOffset <= bytes.size.toLong()) {
+                entries += BifFrameEntry(ts, offset, (nextOffset - offset).toInt())
+            }
             pos += 8
         }
         return entries

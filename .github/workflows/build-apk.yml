@@ -26,7 +26,7 @@ jobs:
       - name: Set up Android SDK 36
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platforms;android-36 build-tools;35.0.1 platform-tools'
+          packages: 'platforms;android-36 build-tools;36.0.0 platform-tools'
 
       - name: Set up Gradle 8.13
         uses: gradle/actions/setup-gradle@v4
@@ -55,9 +55,10 @@ jobs:
           else
             keytool -genkeypair -v \
               -keystore /tmp/lumaxr-release.jks \
-              -alias lumaxr \
+              -alias "${{ secrets.RELEASE_KEY_ALIAS || 'lumaxr' }}" \
               -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass lumaxr_ci -keypass lumaxr_ci \
+              -storepass "${{ secrets.RELEASE_KEYSTORE_PASSWORD || 'lumaxr_ci' }}" \
+              -keypass "${{ secrets.RELEASE_KEY_PASSWORD || 'lumaxr_ci' }}" \
               -dname "CN=LumaXR CI, OU=Media, O=LumaXR, L=IN, C=IN"
           fi
 
@@ -70,9 +71,9 @@ jobs:
           LUMAXR_VERSION_CODE: ${{ steps.build_meta.outputs.version_code }}
           LUMAXR_VERSION_NAME: ${{ steps.build_meta.outputs.version_name }}
           LUMAXR_KEYSTORE_PATH: /tmp/lumaxr-release.jks
-          LUMAXR_KEYSTORE_PASSWORD: lumaxr_ci
-          LUMAXR_KEY_ALIAS: lumaxr
-          LUMAXR_KEY_PASSWORD: lumaxr_ci
+          LUMAXR_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD || 'lumaxr_ci' }}
+          LUMAXR_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS || 'lumaxr' }}
+          LUMAXR_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD || 'lumaxr_ci' }}
         run: |
           gradle assembleRelease \
             -PappId="${LUMAXR_APP_ID}" \
@@ -83,28 +84,43 @@ jobs:
       - name: Verify 16 KB ELF Page Alignment & APK ZipAlign
         id: verify_16k
         run: |
-          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          set -euo pipefail
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" ! -name "*-unsigned.apk" | head -n 1)
           echo "apk_path=${APK_PATH}" >> $GITHUB_OUTPUT
           test -f "${APK_PATH}"
 
           ZIPALIGN=$(find "${ANDROID_HOME}/build-tools" -name "zipalign" | sort -V | tail -n 1)
+          APKSIGNER=$(find "${ANDROID_HOME}/build-tools" -name "apksigner" | sort -V | tail -n 1)
           echo "Checking 16KB ZIP alignment with ${ZIPALIGN}..."
-          "${ZIPALIGN}" -c -P 16 -v 4 "${APK_PATH}" | tail -n 15
+          "${ZIPALIGN}" -c -P 16 -v 4 "${APK_PATH}" > /tmp/zipalign.log
+          tail -n 15 /tmp/zipalign.log
 
-          mkdir -p /tmp/apk_unzip
-          unzip -q -o "${APK_PATH}" "lib/arm64-v8a/*.so" -d /tmp/apk_unzip || true
+          echo "Verifying APK signature with ${APKSIGNER}..."
+          "${APKSIGNER}" verify --verbose "${APK_PATH}"
+
+          rm -rf /tmp/apk_unzip && mkdir -p /tmp/apk_unzip
+          unzip -q -o "${APK_PATH}" "lib/arm64-v8a/*.so" -d /tmp/apk_unzip
+
+          SO_COUNT=$(find /tmp/apk_unzip -name "*.so" | wc -l)
+          if [ "$SO_COUNT" -eq 0 ]; then
+            echo "ERROR: Zero arm64-v8a .so libraries found inside APK!"
+            exit 1
+          fi
 
           FAILED=0
-          REPORT=""
+          REPORT_FILE=/tmp/so_align_report.md
+          : > "$REPORT_FILE"
           for sofile in /tmp/apk_unzip/lib/arm64-v8a/*.so; do
-            [ -e "$sofile" ] || continue
-            ALIGN_HEX=$(readelf -l "$sofile" | awk '/LOAD/ {getline; print $NF}' | sort -u | tr '\n' ' ')
-            echo "$(basename "$sofile") -> LOAD Align: ${ALIGN_HEX}"
-            if readelf -l "$sofile" | grep -A1 "LOAD" | grep -Eq "0x1000$|0x2000$"; then
-              echo "ERROR: $(basename "$sofile") is NOT 16 KB (0x4000) aligned!"
-              FAILED=1
-            fi
-            REPORT="${REPORT}\n- \`$(basename "$sofile")\`: LOAD Align \`${ALIGN_HEX}\`"
+            ALIGNS=$(readelf -lW "$sofile" | awk '/LOAD/ {print $NF}')
+            echo "$(basename "$sofile") -> LOAD Align: $(echo $ALIGNS | tr '\n' ' ')"
+            for a in $ALIGNS; do
+              DEC=$((a))
+              if [ "$DEC" -lt 16384 ] || [ $((DEC % 16384)) -ne 0 ]; then
+                echo "ERROR: $(basename "$sofile") has LOAD alignment $a (< 0x4000)!"
+                FAILED=1
+              fi
+            done
+            echo "- \`$(basename "$sofile")\`: LOAD Align \`$(echo $ALIGNS | tr '\n' ' ' | sed 's/ $//')\`" >> "$REPORT_FILE"
           done
           if [ "$FAILED" -ne 0 ]; then
             exit 1
@@ -130,10 +146,13 @@ jobs:
             echo ""
             echo "- **Dynamic Package Name (\`applicationId\`):** \`${{ steps.build_meta.outputs.app_id }}\`"
             echo "- **Target Hardware:** Xiaomi Redmi Pad Pro 5G (\`24074RPD2I\` / \`ruan_in\`), Android 16 (API 36), Adreno 710"
-            echo "- **16 KB Page-Size Verification:** All \`lib/arm64-v8a/*.so\` ELF \`LOAD\` segments verified \`>= 0x4000\` + \`zipalign -P 16\` passed"
+            echo "- **16 KB Page-Size Verification:** Verified \`>= 0x4000\` on all \`arm64-v8a\` \`LOAD\` segments + \`zipalign -P 16\` + \`apksigner verify\`"
             echo "- **APK SHA-256:** \`${{ steps.verify_16k.outputs.sha256 }}\`"
             echo ""
-            echo "### Release Summary"
+            echo "### 16 KB Native ELF Verification"
+            cat /tmp/so_align_report.md
+            echo ""
+            echo "### Changelog Summary"
             echo ""
             echo "#### Added"
             echo "- Dual-engine HDR/Dolby Vision video core (\`libmpv + libplacebo\` \`vo=gpu-next\` + Hard-Gated \`Media3 1.11.1\` Dolby HAL)"
@@ -144,15 +163,19 @@ jobs:
             echo ""
             echo "#### Changed"
             echo "- Rotated APK \`applicationId\` to \`${{ steps.build_meta.outputs.app_id }}\` for side-by-side CI testing"
-            echo "- Enforced uncompressed \`jniLibs\` packaging and 16 KB page-size verification gate"
+            echo "- Enforced uncompressed \`jniLibs\` packaging and strict numeric 16 KB ELF page-size verification gate"
             echo ""
             echo "#### Fixed"
             echo "- Mitigated HyperOS \`ruan\` \`desiredRatio(10.00)\` milky-black HWC quirk via hard-gated SDR/sRGB calibration & \`target-contrast=1200\`"
             echo "- Prevented Navigation 3 Predictive Back \`ApproachLayout\` glitches via two-phase \`sharedElementWithCallerManagedVisibility\`"
+            echo "- Applied 42-agent team audit fixes across GLSL shaders, Media3/libmpv lifecycles, USB bit-perfect, TTML/lyrics clock, and RangeChunkCache"
             echo ""
-            echo "#### Enhancements & Upgrades"
-            echo "- Upgraded \`AudioFftAnalyzer\`, \`ThermalGovernor\` (API 36 \`getGpuHeadroom\`), and \`LumaHaptics\` (API 36 \`WaveformEnvelopeBuilder\`)"
-            echo "- Added 1-tap JSON/ZIP \`ConfigBackupManager\` so tuning survives dynamic package ID updates"
+            echo "#### Enhancements"
+            echo "- Added 120 Hz Kawarp GLES 3.2 GPU bloom + MilkDrop/Plasma visualizer and smooth-scrolling \`AmLyricsView\` with vocal hold bloom"
+            echo "- Added smart 16:10 aspect zoom/subtitle placement above letterbox bars and A/B split comparison wipe + Hold Original bypass"
+            echo ""
+            echo "#### Upgraded"
+            echo "- Updated to Android 16 (API 36), Navigation 3 \`1.2.2\`, Media3 \`1.11.1\`, Room \`2.8.5\`, Compose BOM \`2026.04.01\`, Kotlin \`2.3.20\`"
             echo ""
             echo "#### Commits Included"
             echo "${COMMITS}"

@@ -4,8 +4,8 @@ import kotlin.math.roundToInt
 
 /**
  * Exact piecewise linear backlight-to-nits spline calibrated for Xiaomi Redmi Pad Pro 5G (ruan):
- * - Segment 1: [0.001709819, 0.49975574] <-> [2.0, 500.0] nits (Normal indoor/outdoor ceiling)
- * - Segment 2: [0.49975574, 1.0]         <-> [500.0, 600.0] nits (Sunlight-gated HBM: minLux=6001)
+ * - Segment 1: [0.001709819, 0.49975574] <-> [2.0, 500.0] nits
+ * - Segment 2: [0.49975574, 1.0]         <-> [500.0, 600.0] nits (HBM minLux=6001)
  */
 object RuanBacklightSpline {
 
@@ -20,10 +20,8 @@ object RuanBacklightSpline {
     const val TARGET_PEAK_MAX_CLAMP_NITS = 300f
     const val TARGET_PEAK_DEFAULT_NITS = 240f
 
-    /**
-     * Converts normalized Android WindowManager screenBrightness [0..1] to physical panel nits [2..600].
-     */
     fun brightnessToNits(normalizedBrightness: Float): Float {
+        if (!normalizedBrightness.isFinite()) return Y0
         val x = normalizedBrightness.coerceIn(0f, 1f)
         if (x <= X0) return Y0
         return if (x <= X1) {
@@ -35,10 +33,8 @@ object RuanBacklightSpline {
         }
     }
 
-    /**
-     * Converts desired panel nits [2..600] to normalized Android screenBrightness [0.001709819..1.0].
-     */
     fun nitsToBrightness(nits: Float): Float {
+        if (!nits.isFinite()) return X0
         val y = nits.coerceIn(Y0, Y2)
         return if (y <= Y1) {
             val t = (y - Y0) / (Y1 - Y0)
@@ -49,23 +45,18 @@ object RuanBacklightSpline {
         }
     }
 
-    /**
-     * Ambient/window-brightness-linked target-peak auto-exposure curve for IPS LCDs.
-     * Maps real indoor viewing luminance (~30..245 nits) smoothly into 180..280 nits
-     * and clamps to [203, 300] nits so dark rooms don't look murky and highlights stay punchy.
-     */
     fun computeAmbientTargetPeakNits(
         estimatedDisplayNits: Float,
         manualOverrideNits: Float? = null,
     ): Int {
-        if (manualOverrideNits != null) {
+        if (manualOverrideNits != null && manualOverrideNits.isFinite()) {
             return manualOverrideNits.coerceIn(TARGET_PEAK_MIN_CLAMP_NITS, TARGET_PEAK_MAX_CLAMP_NITS).roundToInt()
         }
-        val indoorFraction = ((estimatedDisplayNits - RuanHardwareProfile.INDOOR_MIN_NITS) /
+        val safeNits = if (estimatedDisplayNits.isFinite()) estimatedDisplayNits else TARGET_PEAK_DEFAULT_NITS
+        val indoorFraction = ((safeNits - RuanHardwareProfile.INDOOR_MIN_NITS) /
             (RuanHardwareProfile.INDOOR_MAX_NITS - RuanHardwareProfile.INDOOR_MIN_NITS)).coerceIn(0f, 1f)
-        // Smooth S-curve across indoor range mapping 180..280 nits, then clamped [203, 300]
         val smooth = indoorFraction * indoorFraction * (3f - 2f * indoorFraction)
-        val rawTarget = 180f + smooth * (280f - 180f)
+        val rawTarget = TARGET_PEAK_MIN_CLAMP_NITS + smooth * (280f - TARGET_PEAK_MIN_CLAMP_NITS)
         return rawTarget.coerceIn(TARGET_PEAK_MIN_CLAMP_NITS, TARGET_PEAK_MAX_CLAMP_NITS).roundToInt()
     }
 }

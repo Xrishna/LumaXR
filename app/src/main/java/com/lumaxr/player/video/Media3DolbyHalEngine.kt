@@ -9,6 +9,7 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
@@ -26,9 +27,6 @@ data class Media3VideoTelemetry(
 
 /**
  * Lean Native Dolby HAL Fallback Engine (Media3 1.11.1).
- * Intentionally contains ZERO duplicate GLSL shader/filter parity layer —
- * strictly routes hardware Dolby Vision (c2.dolby.decoder.hevc) and Dolby Atmos audio
- * (c2.dolby.eac3.decoder / c2.dolby.ac4.decoder) directly to SurfaceView.
  */
 class Media3DolbyHalEngine(private val context: Context) {
 
@@ -66,6 +64,25 @@ class Media3DolbyHalEngine(private val context: Context) {
                     durationMs = exo.duration.coerceAtLeast(0L),
                 )
             }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    _telemetry.value = _telemetry.value.copy(
+                        durationMs = exo.duration.coerceAtLeast(0L),
+                    )
+                }
+            }
+        })
+
+        exo.addAnalyticsListener(object : AnalyticsListener {
+            override fun onVideoDecoderInitialized(
+                eventTime: AnalyticsListener.EventTime,
+                decoderName: String,
+                initializedTimestampMs: Long,
+                initializationDurationMs: Long,
+            ) {
+                _telemetry.value = _telemetry.value.copy(decoderName = decoderName)
+            }
         })
 
         exo.setVideoSurfaceView(surfaceView)
@@ -99,6 +116,7 @@ class Media3DolbyHalEngine(private val context: Context) {
     fun destroy() {
         player?.release()
         player = null
+        _telemetry.value = Media3VideoTelemetry()
     }
 
     private fun reorderDolbyPreferred(

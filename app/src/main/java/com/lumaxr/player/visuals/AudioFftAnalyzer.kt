@@ -4,22 +4,18 @@ import android.media.audiofx.Visualizer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlin.math.hypot
 import kotlin.math.ln
 
 data class AudioFftFrame(
-    val bass: Float = 0f,     // 20 - 140 Hz
-    val mid: Float = 0f,      // 140 - 2000 Hz
-    val treble: Float = 0f,   // 2000 - 16000 Hz
+    val bass: Float = 0f,
+    val mid: Float = 0f,
+    val treble: Float = 0f,
     val spectrumBars: List<Float> = List(48) { 0f },
     val waveformSamples: List<Float> = List(64) { 0f },
 )
 
-/**
- * Low-latency Android Visualizer FFT & Waveform analyzer.
- * Strictly binds to prepared audioSessionId > 0, uses SCALING_MODE_NORMALIZED,
- * converts millihertz samplingRate / 1000f for accurate bin mapping, and disables before release().
- */
 class AudioFftAnalyzer {
 
     private var visualizer: Visualizer? = null
@@ -36,22 +32,26 @@ class AudioFftAnalyzer {
         if (audioSessionId <= 0) return
         if (attachedSessionId == audioSessionId && visualizer != null) return
         release()
-        runCatching {
+        var pending: Visualizer? = null
+        try {
             val v = Visualizer(audioSessionId)
+            pending = v
             val range = Visualizer.getCaptureSizeRange()
             val targetSize = 1024.coerceIn(range[0], range[1])
             v.captureSize = Integer.highestOneBit(targetSize)
             v.scalingMode = Visualizer.SCALING_MODE_NORMALIZED
+            val maxRate = Visualizer.getMaxCaptureRate().coerceAtLeast(1000)
+            val rate = (maxRate / 2).coerceIn(1000, maxRate)
             v.setDataCaptureListener(
                 object : Visualizer.OnDataCaptureListener {
                     override fun onWaveFormDataCapture(vis: Visualizer?, waveform: ByteArray?, samplingRate: Int) {
                         if (waveform == null || waveform.isEmpty()) return
-                        val step = (waveform.size / 64).coerceAtLeast(1)
                         val wave = List(64) { idx ->
-                            val raw = (waveform[(idx * step).coerceAtMost(waveform.lastIndex)].toInt() and 0xFF) - 128
+                            val sampleIdx = ((idx.toLong() * waveform.size) / 64L).toInt().coerceIn(0, waveform.lastIndex)
+                            val raw = (waveform[sampleIdx].toInt() and 0xFF) - 128
                             (raw / 128f).coerceIn(-1f, 1f)
                         }
-                        _frame.value = _frame.value.copy(waveformSamples = wave)
+                        _frame.update { it.copy(waveformSamples = wave) }
                     }
 
                     override fun onFftDataCapture(vis: Visualizer?, fft: ByteArray?, samplingRateMilliHz: Int) {
@@ -60,13 +60,17 @@ class AudioFftAnalyzer {
                         processFft(fft, sampleRateHz)
                     }
                 },
-                (Visualizer.getMaxCaptureRate() / 2).coerceAtLeast(10_000),
+                rate,
                 true,
                 true,
             )
             v.enabled = true
             visualizer = v
             attachedSessionId = audioSessionId
+            pending = null
+        } catch (_: Throwable) {
+            runCatching { pending?.enabled = false }
+            runCatching { pending?.release() }
         }
     }
 
@@ -102,7 +106,6 @@ class AudioFftAnalyzer {
         smoothMid = smoothMid * 0.68f + rawMid * 0.32f
         smoothTreble = smoothTreble * 0.72f + rawTreb * 0.28f
 
-        // 48 logarithmic frequency bars
         val bars = List(48) { b ->
             val t0 = b / 48f
             val t1 = (b + 1) / 48f
@@ -115,22 +118,26 @@ class AudioFftAnalyzer {
             peak.coerceIn(0f, 1f)
         }
 
-        _frame.value = _frame.value.copy(
-            bass = smoothBass.coerceIn(0f, 1.5f),
-            mid = smoothMid.coerceIn(0f, 1.5f),
-            treble = smoothTreble.coerceIn(0f, 1.5f),
-            spectrumBars = bars,
-        )
+        _frame.update {
+            it.copy(
+                bass = smoothBass.coerceIn(0f, 1.5f),
+                mid = smoothMid.coerceIn(0f, 1.5f),
+                treble = smoothTreble.coerceIn(0f, 1.5f),
+                spectrumBars = bars,
+            )
+        }
     }
 
     fun release() {
         visualizer?.let { v ->
-            runCatching {
-                v.enabled = false
-                v.release()
-            }
+            runCatching { v.enabled = false }
+            runCatching { v.release() }
         }
         visualizer = null
         attachedSessionId = 0
+        smoothBass = 0f
+        smoothMid = 0f
+        smoothTreble = 0f
+        _frame.value = AudioFftFrame()
     }
 }

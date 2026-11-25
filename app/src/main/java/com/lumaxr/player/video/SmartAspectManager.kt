@@ -1,5 +1,8 @@
 package com.lumaxr.player.video
 
+import kotlin.math.max
+import kotlin.math.roundToInt
+
 enum class AspectMode(val label: String) {
     ORIGINAL("Original Aspect"),
     SOFT_FILL_16_10("16:10 Soft-Fill (7%)"),
@@ -13,15 +16,12 @@ enum class SubtitlePlacement(val label: String) {
 
 data class SmartAspectState(
     val aspectMode: AspectMode = AspectMode.ORIGINAL,
-    val softFillPercent: Float = 0.07f, // 5-10% soft-fill for 2.39:1 scope films
+    val softFillPercent: Float = 0.07f,
     val subtitlePlacement: SubtitlePlacement = SubtitlePlacement.ABOVE_LETTERBOX,
     val letterboxTopNorm: Float = 0.0f,
     val letterboxBottomNorm: Float = 1.0f,
 )
 
-/**
- * Smart Black-Bar & 16:10 Aspect Ratio Manager for 2560x1600 Redmi Pad Pro panel.
- */
 class SmartAspectManager {
 
     fun computeLetterboxBounds(
@@ -36,7 +36,7 @@ class SmartAspectManager {
             return state.copy(letterboxTopNorm = 0f, letterboxBottomNorm = 1f)
         }
         val effectiveZoom = if (state.aspectMode == AspectMode.SOFT_FILL_16_10) {
-            1f + state.softFillPercent.coerceIn(0.05f, 0.10f)
+            (1f + state.softFillPercent.coerceIn(0.05f, 0.10f)).coerceAtMost(videoAspect / panelAspect)
         } else {
             1f
         }
@@ -48,25 +48,36 @@ class SmartAspectManager {
         )
     }
 
-    fun toMpvVideoZoom(state: SmartAspectState, videoWidth: Int, videoHeight: Int): Double {
+    fun toMpvVideoZoom(
+        state: SmartAspectState,
+        videoWidth: Int,
+        videoHeight: Int,
+        panelAspect: Double = 1.6,
+    ): Double {
         if (videoWidth <= 0 || videoHeight <= 0) return 0.0
-        val panelAspect = 1.6
         val videoAspect = videoWidth.toDouble() / videoHeight.toDouble()
         return when (state.aspectMode) {
             AspectMode.ORIGINAL -> 0.0
             AspectMode.SOFT_FILL_16_10 -> {
-                val factor = 1.0 + state.softFillPercent.coerceIn(0.05f, 0.10f)
-                kotlin.math.log2(factor)
+                if (videoAspect <= panelAspect + 0.02) 0.0
+                else {
+                    val maxZoom = videoAspect / panelAspect
+                    val factor = (1.0 + state.softFillPercent.coerceIn(0.05f, 0.10f)).coerceAtMost(maxZoom)
+                    kotlin.math.log2(factor)
+                }
             }
             AspectMode.FILL_16_10 -> {
-                val ratio = (videoAspect / panelAspect).coerceAtLeast(1.0)
+                val ratio = max(videoAspect / panelAspect, panelAspect / videoAspect).coerceAtLeast(1.0)
                 kotlin.math.log2(ratio)
             }
         }
     }
 
-    fun toMpvSubPos(placement: SubtitlePlacement): Int = when (placement) {
-        SubtitlePlacement.ABOVE_LETTERBOX -> 86
-        SubtitlePlacement.INSIDE_LETTERBOX -> 98
+    fun toMpvSubPos(placement: SubtitlePlacement, state: SmartAspectState = SmartAspectState()): Int {
+        val bottomPct = (state.letterboxBottomNorm * 100f).roundToInt().coerceIn(55, 100)
+        return when (placement) {
+            SubtitlePlacement.ABOVE_LETTERBOX -> (bottomPct - 4).coerceIn(50, 94)
+            SubtitlePlacement.INSIDE_LETTERBOX -> if (bottomPct < 96) ((bottomPct + 100) / 2).coerceIn(88, 99) else 96
+        }
     }
 }

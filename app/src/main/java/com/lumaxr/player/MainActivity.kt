@@ -15,6 +15,7 @@ import androidx.activity.viewModels
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.ui.graphics.Color
+import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
 import com.lumaxr.player.LumaXrApplication
 import com.lumaxr.player.pro.PipController
@@ -24,11 +25,14 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: MainViewModel by viewModels()
     private var pipController: PipController? = null
+    private val externalVideoUri = mutableStateOf<String?>(null)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
-    ) {
-        viewModel.refreshMediaLibraries()
+    ) { results ->
+        if (results.values.any { it }) {
+            viewModel.refreshMediaLibraries()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -45,7 +49,7 @@ class MainActivity : ComponentActivity() {
             activity = this,
             refreshRateManager = app.container.refreshRateManager,
             onPlayPause = {
-                val cur = app.container.videoCoordinator.mpvEngine.telemetry.value.paused
+                val cur = app.container.videoCoordinator.isPaused()
                 app.container.videoCoordinator.setPaused(!cur)
             },
             onSeekDeltaSec = { delta ->
@@ -55,7 +59,7 @@ class MainActivity : ComponentActivity() {
 
         requestRuntimeMediaPermissions()
 
-        val initialUri = intent?.dataString
+        externalVideoUri.value = intent?.dataString
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
@@ -67,9 +71,18 @@ class MainActivity : ComponentActivity() {
             ) {
                 LumaNavigationRoot(
                     viewModel = viewModel,
-                    initialVideoUri = initialUri,
+                    externalVideoUri = externalVideoUri.value,
                 )
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val uri = intent.dataString
+        if (!uri.isNullOrBlank()) {
+            externalVideoUri.value = uri
         }
     }
 
@@ -90,17 +103,39 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        (application as LumaXrApplication).container.videoCoordinator.unbindActivity(this)
         pipController?.unregister()
         super.onDestroy()
     }
 
     private fun requestRuntimeMediaPermissions() {
-        val needed = listOf(
-            Manifest.permission.READ_MEDIA_VIDEO,
-            Manifest.permission.READ_MEDIA_AUDIO,
-            Manifest.permission.POST_NOTIFICATIONS,
-        ).filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        val needed = buildList {
+            val hasFullVideo = ContextCompat.checkSelfPermission(
+                this@MainActivity,
+                Manifest.permission.READ_MEDIA_VIDEO,
+            ) == PackageManager.PERMISSION_GRANTED
+            val hasPartialVisual = ContextCompat.checkSelfPermission(
+                this@MainActivity,
+                Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!hasFullVideo && !hasPartialVisual) {
+                add(Manifest.permission.READ_MEDIA_VIDEO)
+                add(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+            }
+            if (ContextCompat.checkSelfPermission(
+                    this@MainActivity,
+                    Manifest.permission.READ_MEDIA_AUDIO,
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                add(Manifest.permission.READ_MEDIA_AUDIO)
+            }
+            if (ContextCompat.checkSelfPermission(
+                    this@MainActivity,
+                    Manifest.permission.POST_NOTIFICATIONS,
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            }
         }
         if (needed.isNotEmpty()) {
             permissionLauncher.launch(needed.toTypedArray())

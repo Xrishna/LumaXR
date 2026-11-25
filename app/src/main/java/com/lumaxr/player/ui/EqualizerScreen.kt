@@ -30,6 +30,7 @@ import androidx.compose.ui.unit.sp
 import com.lumaxr.player.music.AutoEqParser
 import com.lumaxr.player.music.DiagnosticAudioMode
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -41,6 +42,7 @@ fun EqualizerScreen(viewModel: MainViewModel) {
     val route by viewModel.container.deviceProfileRouter.activeRoute.collectAsState()
     val musicState by viewModel.container.musicCoordinator.state.collectAsState()
     val scope = rememberCoroutineScope()
+    val dspEnabled = !usbState.activeBitPerfect
 
     Column(
         modifier = Modifier
@@ -50,6 +52,13 @@ fun EqualizerScreen(viewModel: MainViewModel) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("Active Output: ${route.displayName}", color = Color(0xFF38BDF8), fontWeight = FontWeight.SemiBold)
+        if (!dspEnabled) {
+            Text(
+                "Bit-Perfect USB Direct is active — PEQ, Crossfeed, and DRC are bypassed.",
+                color = Color(0xFFFBBF24),
+                fontSize = 12.sp,
+            )
+        }
 
         if (usbState.connected) {
             Row(
@@ -95,6 +104,7 @@ fun EqualizerScreen(viewModel: MainViewModel) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AutoEqParser.BUILTIN_PRESETS.forEach { preset ->
                 FilterChip(
+                    enabled = dspEnabled,
                     selected = dspState.activePresetName == preset.name,
                     onClick = { dsp.applyAutoEqPreset(preset) },
                     label = { Text(preset.name, fontSize = 11.sp) },
@@ -109,6 +119,7 @@ fun EqualizerScreen(viewModel: MainViewModel) {
         ) {
             Text("BS2B Crossfeed", color = Color.White)
             Switch(
+                enabled = dspEnabled,
                 checked = dspState.crossfeedEnabled,
                 onCheckedChange = { dsp.updateToggles(crossfeedEnabled = it) },
             )
@@ -121,6 +132,7 @@ fun EqualizerScreen(viewModel: MainViewModel) {
         ) {
             Text("Night Mode DRC Dialogue Boost", color = Color.White)
             Switch(
+                enabled = dspEnabled,
                 checked = dspState.nightModeDrcEnabled,
                 onCheckedChange = { dsp.updateToggles(nightModeDrcEnabled = it) },
             )
@@ -128,6 +140,7 @@ fun EqualizerScreen(viewModel: MainViewModel) {
 
         Text("Karaoke Vocal-Reduce (Mid/Side): ${(dspState.karaokeVocalReduceStrength * 100).toInt()}%", color = Color.White, fontSize = 13.sp)
         Slider(
+            enabled = dspEnabled,
             value = dspState.karaokeVocalReduceStrength,
             onValueChange = { dsp.updateToggles(karaokeStrength = it) },
         )
@@ -136,6 +149,7 @@ fun EqualizerScreen(viewModel: MainViewModel) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             DiagnosticAudioMode.entries.forEach { mode ->
                 FilterChip(
+                    enabled = dspEnabled,
                     selected = dspState.diagnosticMode == mode,
                     onClick = { dsp.updateToggles(diagnosticMode = mode) },
                     label = { Text(mode.name.replace('_', ' '), fontSize = 11.sp) },
@@ -143,18 +157,28 @@ fun EqualizerScreen(viewModel: MainViewModel) {
             }
         }
 
-        Text("15-Band Parametric EQ (Preamp ${"%.1f".format(dspState.preampDb)} dB)", color = Color.White, fontWeight = FontWeight.SemiBold)
+        Text(
+            "15-Band Parametric EQ (Preamp ${String.format(Locale.US, "%.1f", dspState.preampDb)} dB)",
+            color = Color.White,
+            fontWeight = FontWeight.SemiBold,
+        )
         AutoEqParser.ISO_15_BANDS_HZ.forEachIndexed { idx, hz ->
             val gain = dspState.bandGainsDb.getOrElse(idx) { 0f }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("${hz.toInt()}Hz", color = Color(0xFF94A3B8), fontSize = 11.sp, modifier = Modifier.padding(end = 8.dp))
                 Slider(
+                    enabled = dspEnabled,
                     value = gain,
                     onValueChange = { dsp.updateBand(idx, it) },
                     valueRange = -12f..12f,
                     modifier = Modifier.weight(1f),
                 )
-                Text("${"%.1f".format(gain)}", color = Color.White, fontSize = 11.sp, modifier = Modifier.padding(start = 8.dp))
+                Text(
+                    String.format(Locale.US, "%.1f", gain),
+                    color = Color.White,
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(start = 8.dp),
+                )
             }
         }
 

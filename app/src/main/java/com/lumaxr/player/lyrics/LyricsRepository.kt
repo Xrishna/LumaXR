@@ -1,5 +1,6 @@
 package com.lumaxr.player.lyrics
 
+import android.net.Uri
 import com.lumaxr.player.data.AudioTrackEntity
 import com.lumaxr.player.data.LyricsCacheDao
 import com.lumaxr.player.data.LyricsCacheEntity
@@ -11,6 +12,8 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 @Serializable
 private data class LrcLibResponse(
@@ -31,16 +34,12 @@ data class LoadedLyricsState(
     val trackKey: String = "",
 )
 
-/**
- * Multi-Provider Online Lyrics Fetcher & Room Offline Cache:
- * 1. Local sidecar .ttml / .lrc files
- * 2. AMLL TTML DB / LyricsPlus-compatible TTML endpoints
- * 3. LRCLIB (/api/get + /api/search with compliant User-Agent)
- * Supports manual "Title - Artist" match fixer and per-track +/-3000 ms offset.
- */
 class LyricsRepository(
     private val cacheDao: LyricsCacheDao,
-    private val client: OkHttpClient = OkHttpClient(),
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .build(),
 ) {
     companion object {
         private const val USER_AGENT = "LumaXR/1.0 (https://github.com/Xrishna/LumaXR)"
@@ -50,13 +49,14 @@ class LyricsRepository(
 
     fun buildTrackKey(track: AudioTrackEntity): String {
         val durSec = (track.durationMs / 1000L).coerceAtLeast(1L)
-        return "${track.artist.lowercase().trim()}|${track.title.lowercase().trim()}|$durSec"
+        val artist = track.artist.lowercase(Locale.ROOT).trim()
+        val title = track.title.lowercase(Locale.ROOT).trim()
+        return if (artist.isBlank() && title.isBlank()) track.uri else "$artist|$title|$durSec"
     }
 
     suspend fun loadLyricsForTrack(track: AudioTrackEntity): LoadedLyricsState = withContext(Dispatchers.IO) {
         val key = buildTrackKey(track)
 
-        // 0. Check Room cache first
         cacheDao.get(key)?.let { cached ->
             return@withContext LoadedLyricsState(
                 document = WordSyncedLyricsParser.parseAuto(cached.rawPayload, cached.provider),
@@ -66,7 +66,6 @@ class LyricsRepository(
             )
         }
 
-        // 1. Local sidecar .ttml / .lrc
         val sidecar = findLocalSidecarLyrics(track.uri.substringBefore("#cue="))
         if (sidecar != null) {
             val (raw, fmt) = sidecar
@@ -79,7 +78,6 @@ class LyricsRepository(
             )
         }
 
-        // 2. AMLL / LyricsPlus TTML lookup
         val amllRaw = fetchAmllOrLyricsPlusTtml(track.title, track.artist, track.durationMs)
         if (!amllRaw.isNullOrBlank()) {
             cacheDao.upsert(LyricsCacheEntity(key, "TTML", amllRaw, "AMLL TTML DB"))
@@ -91,12 +89,11 @@ class LyricsRepository(
             )
         }
 
-        // 3. LRCLIB fallback
         val lrcRes = fetchLrcLib(track.title, track.artist, track.album, (track.durationMs / 1000L).toInt())
         if (lrcRes != null) {
-            val payload = lrcRes.syncedLyrics ?: lrcRes.plainLyrics.orEmpty()
+            val payload = lrcRes.syncedLyrics?.takeIf { it.isNotBlank() } ?: lrcRes.plainLyrics.orEmpty()
             if (payload.isNotBlank()) {
-                val fmt = if (lrcRes.syncedLyrics != null) "LRC" else "PLAIN"
+                val fmt = if (!lrcRes.syncedLyrics.isNullOrBlank()) "LRC" else "PLAIN"
                 cacheDao.upsert(LyricsCacheEntity(key, fmt, payload, "LRCLIB"))
                 return@withContext LoadedLyricsState(
                     document = WordSyncedLyricsParser.parseAuto(payload, "LRCLIB"),
@@ -111,8 +108,10 @@ class LyricsRepository(
     }
 
     suspend fun searchManual(trackKey: String, query: String): LoadedLyricsState = withContext(Dispatchers.IO) {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isEmpty()) return@withContext LoadedLyricsState(trackKey = trackKey)
         val url = "https://lrclib.net/api/search".toHttpUrl().newBuilder()
-            .addQueryParameter("q", query)
+            .addQueryParameter("q", cleanQuery)
             .build()
         val req = Request.Builder().url(url).header("User-Agent", USER_AGENT).build()
         val list = runCatching {
@@ -124,9 +123,10 @@ class LyricsRepository(
         }.getOrDefault(emptyList())
 
         val best = list.firstOrNull { !it.syncedLyrics.isNullOrBlank() } ?: list.firstOrNull()
-        val payload = best?.syncedLyrics ?: best?.plainLyrics.orEmpty()
+        val payload = best?.syncedLyrics?.takeIf { it.isNotBlank() } ?: best?.plainLyrics.orEmpty()
         if (payload.isNotBlank()) {
-            cacheDao.upsert(LyricsCacheEntity(trackKey, "LRC", payload, "LRCLIB Manual Match"))
+            val fmt = if (!best?.syncedLyrics.isNullOrBlank()) "LRC" else "PLAIN"
+            cacheDao.upsert(LyricsCacheEntity(trackKey, fmt, payload, "LRCLIB Manual Match"))
             return@withContext LoadedLyricsState(
                 document = WordSyncedLyricsParser.parseAuto(payload, "LRCLIB Manual Match"),
                 offsetMs = 0,
@@ -142,8 +142,14 @@ class LyricsRepository(
         cacheDao.updateOffset(trackKey, clamped)
     }
 
-    private fun findLocalSidecarLyrics(audioPath: String): Pair<String, String>? {
-        val f = File(audioPath)
+    private fun findLocalSidecarLyrics(audioUriOrPath: String): Pair<String, String>? {
+        val parsed = runCatching { Uri.parse(audioUriOrPath) }.getOrNull()
+        val fsPath = when {
+            parsed?.scheme == "file" -> parsed.path ?: return null
+            parsed?.scheme == null -> audioUriOrPath
+            else -> return null
+        }
+        val f = File(fsPath)
         val dir = f.parentFile ?: return null
         val base = f.nameWithoutExtension
         val ttml = File(dir, "$base.ttml")
@@ -184,9 +190,10 @@ class LyricsRepository(
                 json.decodeFromString<LrcLibResponse>(resp.body?.string().orEmpty())
             }
         }.getOrNull()
-        if (exact != null) return exact
+        if (exact != null && (!exact.syncedLyrics.isNullOrBlank() || !exact.plainLyrics.isNullOrBlank())) {
+            return exact
+        }
 
-        // Fallback search
         val sUrl = "https://lrclib.net/api/search".toHttpUrl().newBuilder()
             .addQueryParameter("track_name", title)
             .addQueryParameter("artist_name", artist)

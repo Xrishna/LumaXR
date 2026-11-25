@@ -8,6 +8,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,6 +38,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -49,20 +51,11 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import com.lumaxr.player.visuals.AgslAlbumBackdrop
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
-/**
- * Native 120 Hz Apple Music Word-by-Word Lyrics View (`AmLyricsView`).
- * - Choreographer `withFrameNanos` interpolated clock anchored to player position & speed (freezes when paused)
- * - Continuous horizontal word sweep + elastic spring lift (-3dp / 1.045x) + >700ms held-note bloom
- * - Duet alignment (v1 left, v2 right), x-bg smaller sub-vocals, translation & romanization
- * - Instrumental interlude (> 4s gap) breathing progress dots
- * - Distance-graded RenderEffect depth-of-field blur that clears immediately when user scrolls + "Resume Sync" pill
- */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun AmLyricsView(
@@ -79,38 +72,54 @@ fun AmLyricsView(
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
-    // 120 Hz interpolated clock
+    val latestPlayerPos by rememberUpdatedState(playerPositionMs)
     var interpolatedMs by remember { mutableLongStateOf(playerPositionMs) }
-    LaunchedEffect(playerPositionMs, isPlaying, playbackSpeed) {
-        interpolatedMs = playerPositionMs
+
+    // Anchor-based 120 Hz choreographer clock (eliminates sub-ms truncation drift & restarts)
+    LaunchedEffect(isPlaying, playbackSpeed) {
+        interpolatedMs = latestPlayerPos
         if (!isPlaying) return@LaunchedEffect
-        var lastNanos = 0L
+        var anchorPos = latestPlayerPos
+        var anchorNanos = 0L
         while (true) {
             withFrameNanos { now ->
-                if (lastNanos != 0L) {
-                    val deltaMs = ((now - lastNanos) / 1_000_000.0 * playbackSpeed).toLong()
-                    interpolatedMs += deltaMs.coerceIn(0L, 100L)
+                if (anchorNanos == 0L) anchorNanos = now
+                val predicted = anchorPos + ((now - anchorNanos) / 1_000_000.0 * playbackSpeed).toLong()
+                if (abs(latestPlayerPos - predicted) > 280L) {
+                    anchorPos = latestPlayerPos
+                    anchorNanos = now
+                    interpolatedMs = latestPlayerPos
+                } else {
+                    interpolatedMs = predicted
                 }
-                lastNanos = now
             }
         }
     }
 
+    LaunchedEffect(playerPositionMs, isPlaying) {
+        if (!isPlaying) interpolatedMs = playerPositionMs
+    }
+
     val effectiveClockMs = interpolatedMs + lyricsState.offsetMs
     val activeIdx = remember(lines, effectiveClockMs) {
-        lines.indexOfLast { effectiveClockMs >= it.startMs }.coerceAtLeast(0)
+        val idx = lines.indexOfLast { effectiveClockMs >= it.startMs }
+        if (idx < 0) 0 else idx
     }
 
     var userDetachedScroll by remember { mutableStateOf(false) }
-    LaunchedEffect(listState.isScrollInProgress) {
-        if (listState.isScrollInProgress) {
-            userDetachedScroll = true
+    LaunchedEffect(listState.interactionSource) {
+        listState.interactionSource.interactions.collect { interaction ->
+            if (interaction is DragInteraction.Start) {
+                userDetachedScroll = true
+            }
         }
     }
 
     LaunchedEffect(activeIdx, userDetachedScroll) {
         if (!userDetachedScroll && lines.isNotEmpty() && activeIdx in lines.indices) {
-            listState.animateScrollToItem(index = activeIdx, scrollOffset = -180)
+            val vh = listState.layoutInfo.viewportSize.height
+            val offset = if (vh > 0) -(vh / 4) else -180
+            listState.animateScrollToItem(index = activeIdx, scrollOffset = offset)
         }
     }
 
@@ -131,8 +140,7 @@ fun AmLyricsView(
                 modifier = Modifier.fillMaxSize(),
             ) {
                 itemsIndexed(lines, key = { idx, item -> "${idx}_${item.startMs}" }) { index, line ->
-                    val isActive = effectiveClockMs in line.startMs..line.endMs ||
-                        (index == activeIdx && effectiveClockMs >= line.startMs)
+                    val isActive = effectiveClockMs in line.startMs..line.endMs
                     val distance = abs(index - activeIdx)
                     val blurPx = if (userDetachedScroll || isActive) {
                         0f
@@ -161,16 +169,19 @@ fun AmLyricsView(
                             }
                             .padding(vertical = 4.dp, horizontal = 6.dp)
                             .graphicsLayer {
-                                renderEffect = AgslAlbumBackdrop.createBlurRenderEffect(blurPx)
+                                renderEffect = if (blurPx > 0.5f) AgslAlbumBackdrop.createBlurRenderEffect(blurPx) else null
                                 alpha = if (isActive) 1f else if (userDetachedScroll) 0.78f else (0.58f - distance * 0.06f).coerceIn(0.24f, 0.65f)
                             },
                     ) {
-                        FlowRow(
-                            horizontalArrangement = if (isRightAligned) Arrangement.End else Arrangement.Start,
-                        ) {
+                        val wordFlowAlign = if (isRightAligned) Arrangement.End else Arrangement.Start
+                        FlowRow(horizontalArrangement = wordFlowAlign) {
                             line.words.forEach { word ->
-                                val progress = if (isActive) LyricGlowModifier.wordProgress(word, effectiveClockMs)
-                                else if (effectiveClockMs > word.endMs) 1f else 0f
+                                val progress = when {
+                                    doc.isSyllableSynced || doc.isLineSynced ->
+                                        if (isActive) LyricGlowModifier.wordProgress(word, effectiveClockMs)
+                                        else if (effectiveClockMs > word.endMs) 1f else 0f
+                                    else -> 1f
+                                }
                                 val isWordActive = effectiveClockMs in word.startMs..word.endMs
                                 val bloom = LyricGlowModifier.heldNoteBloomFactor(word, effectiveClockMs, style)
 
@@ -186,7 +197,7 @@ fun AmLyricsView(
                                 )
 
                                 val brush = LyricGlowModifier.buildWordSweepBrush(
-                                    progress = if (doc.isLineSynced) progress else 1f,
+                                    progress = progress,
                                     highlightColor = style.highlightColor,
                                 )
 
@@ -196,7 +207,6 @@ fun AmLyricsView(
                                         brush = brush,
                                         fontSize = style.fontSizeSp.sp,
                                         fontWeight = FontWeight.Bold,
-                                        letterSpacing = (bloom * 0.03f).em,
                                         shadow = if (bloom > 0.05f) {
                                             Shadow(
                                                 color = style.highlightColor.copy(alpha = (0.55f * bloom).coerceAtMost(0.95f)),
@@ -215,9 +225,11 @@ fun AmLyricsView(
 
                         if (line.backgroundVocalWords.isNotEmpty()) {
                             Spacer(Modifier.height(2.dp))
-                            FlowRow {
+                            FlowRow(horizontalArrangement = wordFlowAlign) {
                                 line.backgroundVocalWords.forEach { bgWord ->
-                                    val p = LyricGlowModifier.wordProgress(bgWord, effectiveClockMs)
+                                    val p = if (doc.isSyllableSynced || doc.isLineSynced) {
+                                        LyricGlowModifier.wordProgress(bgWord, effectiveClockMs)
+                                    } else 1f
                                     Text(
                                         text = bgWord.text,
                                         style = TextStyle(
@@ -251,7 +263,6 @@ fun AmLyricsView(
                             )
                         }
 
-                        // Instrumental interlude breathing dots (> 4s gap)
                         if (gapAfterMs > 4000L && effectiveClockMs in line.endMs..(nextLine?.startMs ?: line.endMs)) {
                             val gapFrac = ((effectiveClockMs - line.endMs).toFloat() / gapAfterMs.toFloat()).coerceIn(0f, 1f)
                             Row(
@@ -308,7 +319,8 @@ fun AmLyricsView(
                     userDetachedScroll = false
                     scope.launch {
                         if (activeIdx in lines.indices) {
-                            listState.animateScrollToItem(activeIdx, -180)
+                            val vh = listState.layoutInfo.viewportSize.height
+                            listState.animateScrollToItem(activeIdx, if (vh > 0) -(vh / 4) else -180)
                         }
                     }
                 },

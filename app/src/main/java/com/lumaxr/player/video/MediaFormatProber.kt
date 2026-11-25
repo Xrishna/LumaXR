@@ -9,6 +9,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
+import java.util.Locale
 
 enum class HdrFormat {
     DV_P5,
@@ -39,12 +40,6 @@ data class ProbedMediaInfo(
     val hasHdr10PlusSei: Boolean = false,
 )
 
-/**
- * Pre-playback bitstream & container prober inspecting MKV/MP4/M2TS/TS headers:
- * - MP4/MKV dvcC / dvvC boxes (Dolby Vision profile 5, 7 MEL/FEL, 8.1, 8.4)
- * - ITU-T T.35 ST 2094-40 HDR10+ dynamic metadata SEI
- * - MediaFormat color transfer (PQ / HLG) & codec dimensions/FPS/bitrate
- */
 class MediaFormatProber(private val context: Context) {
 
     suspend fun probe(uriString: String): ProbedMediaInfo = withContext(Dispatchers.IO) {
@@ -62,69 +57,75 @@ class MediaFormatProber(private val context: Context) {
         var durationMs = 0L
         var colorTransfer = -1
         var isDolbyVisionMime = false
+        var hasCsdHdr10Plus = false
+        var hasCsdDvBox: Pair<Int, Int>? = null
+        var bestVideoArea = -1
 
         val extractor = MediaExtractor()
         try {
-            if (uri.scheme == "file" && uri.path != null) {
-                extractor.setDataSource(uri.path!!)
-            } else if (uri.scheme == "http" || uri.scheme == "https") {
-                extractor.setDataSource(uriString, emptyMap())
-            } else {
-                extractor.setDataSource(context, uri, null)
+            when {
+                uri.scheme == null || uri.scheme == "file" -> extractor.setDataSource(uri.path ?: uriString)
+                uri.scheme == "http" || uri.scheme == "https" -> extractor.setDataSource(uriString, emptyMap())
+                else -> extractor.setDataSource(context, uri, null)
             }
             for (i in 0 until extractor.trackCount) {
                 val fmt = extractor.getTrackFormat(i)
                 val mime = fmt.getString(MediaFormat.KEY_MIME).orEmpty()
-                if (mime.startsWith("video/") && width == 1920 && durationMs == 0L) {
-                    width = fmt.getIntOrDefault(MediaFormat.KEY_WIDTH, 1920)
-                    height = fmt.getIntOrDefault(MediaFormat.KEY_HEIGHT, 1080)
-                    fps = fmt.getFloatOrDefault(MediaFormat.KEY_FRAME_RATE, 24.0f).toDouble()
-                    val bps = fmt.getIntOrDefault(MediaFormat.KEY_BIT_RATE, 0)
-                    if (bps > 0) bitrateMbps = bps / 1_000_000.0
-                    durationMs = fmt.getLongOrDefault(MediaFormat.KEY_DURATION, 0L) / 1000L
-                    colorTransfer = fmt.getIntOrDefault(MediaFormat.KEY_COLOR_TRANSFER, -1)
-                    videoCodec = mime.substringAfter("video/")
-                    isDolbyVisionMime = mime.equals("video/dolby-vision", ignoreCase = true)
-                    val profile = fmt.getIntOrDefault(MediaFormat.KEY_PROFILE, -1)
-                    if (mime.contains("hevc") && (profile == 2 || profile == 4096 || colorTransfer == MediaFormat.COLOR_TRANSFER_ST2084 || colorTransfer == MediaFormat.COLOR_TRANSFER_HLG)) {
-                        bitDepth = 10
-                    }
-                    if (isDolbyVisionMime) {
-                        bitDepth = 10
-                    }
-                    // Check CSD-0 for dvcC/dvvC or HDR10+ SEI if available
-                    val csd0 = fmt.getByteBuffer("csd-0")
-                    if (csd0 != null && containsHdr10PlusT35(csd0)) {
-                        // flagged below
+                if (mime.startsWith("video/")) {
+                    val w = fmt.getIntSafe(MediaFormat.KEY_WIDTH, 1920)
+                    val h = fmt.getIntSafe(MediaFormat.KEY_HEIGHT, 1080)
+                    val area = w * h
+                    if (area > bestVideoArea) {
+                        bestVideoArea = area
+                        width = w
+                        height = h
+                        fps = fmt.getFloatSafe(MediaFormat.KEY_FRAME_RATE, 24.0f).toDouble()
+                        val bps = fmt.getIntSafe(MediaFormat.KEY_BIT_RATE, 0)
+                        if (bps > 0) bitrateMbps = bps / 1_000_000.0
+                        durationMs = fmt.getLongSafe(MediaFormat.KEY_DURATION, 0L) / 1000L
+                        colorTransfer = fmt.getIntSafe(MediaFormat.KEY_COLOR_TRANSFER, -1)
+                        videoCodec = mime.substringAfter("video/")
+                        isDolbyVisionMime = mime.equals("video/dolby-vision", ignoreCase = true)
+                        val profile = fmt.getIntSafe(MediaFormat.KEY_PROFILE, -1)
+                        if (mime.contains("hevc") && (profile in setOf(2, 4096, 8192) ||
+                                colorTransfer == MediaFormat.COLOR_TRANSFER_ST2084 ||
+                                colorTransfer == MediaFormat.COLOR_TRANSFER_HLG)
+                        ) {
+                            bitDepth = 10
+                        }
+                        if (isDolbyVisionMime) bitDepth = 10
+                        val csd0 = fmt.getByteBuffer("csd-0")
+                        if (csd0 != null) {
+                            if (containsHdr10PlusT35(csd0)) hasCsdHdr10Plus = true
+                            val arr = ByteArray(csd0.remaining().coerceAtMost(8192)).also { csd0.duplicate().get(it) }
+                            if (hasCsdDvBox == null) hasCsdDvBox = parseDvcCOrDvvC(arr)
+                        }
                     }
                 } else if (mime.startsWith("audio/") && audioCodec == "aac") {
                     audioCodec = mime.substringAfter("audio/")
                 }
             }
         } catch (_: Throwable) {
-            // Network/MKV fallback via filename + raw header scan
         } finally {
             runCatching { extractor.release() }
         }
 
-        val dvBox = parseDvcCOrDvvC(headerBytes)
-        val hasHdr10Plus = containsHdr10PlusBytes(headerBytes)
+        val dvBox = parseDvcCOrDvvC(headerBytes) ?: hasCsdDvBox
+        val hasHdr10Plus = hasCsdHdr10Plus || containsHdr10PlusBytes(headerBytes)
+        val fileName = uri.lastPathSegment?.substringAfterLast('/') ?: uriString.substringAfterLast('/')
         val hdrFormat = classifyHdrFormat(
             dvProfile = dvBox?.first,
             dvCompatibilityId = dvBox?.second,
             isDolbyVisionMime = isDolbyVisionMime,
             hasHdr10PlusSei = hasHdr10Plus,
             colorTransfer = colorTransfer,
-            hintName = uriString,
+            hintName = fileName,
         )
-        if (hdrFormat != HdrFormat.SDR && bitDepth < 10) {
-            bitDepth = 10
-        }
+        if (hdrFormat != HdrFormat.SDR && bitDepth < 10) bitDepth = 10
 
-        val title = uri.lastPathSegment?.substringAfterLast('/') ?: uriString
         ProbedMediaInfo(
             uri = uriString,
-            title = title,
+            title = fileName,
             container = container,
             hdrFormat = hdrFormat,
             width = width,
@@ -149,44 +150,33 @@ class MediaFormatProber(private val context: Context) {
         colorTransfer: Int,
         hintName: String = "",
     ): HdrFormat {
+        val lower = hintName.lowercase(Locale.ROOT)
         return when (dvProfile) {
             5 -> HdrFormat.DV_P5
             7 -> HdrFormat.DV_P7_MEL_FEL
             8 -> if (dvCompatibilityId == 4) HdrFormat.DV_P8_4 else HdrFormat.DV_P8_1
             else -> when {
-                isDolbyVisionMime -> {
-                    val lower = hintName.lowercase()
-                    when {
-                        "p7" in lower || "fel" in lower || "mel" in lower || "remux" in lower -> HdrFormat.DV_P7_MEL_FEL
-                        "p5" in lower || "dv5" in lower -> HdrFormat.DV_P5
-                        "p8.4" in lower || "hlg" in lower -> HdrFormat.DV_P8_4
-                        else -> HdrFormat.DV_P8_1
-                    }
+                isDolbyVisionMime -> when {
+                    Regex("""\b(p7|fel|mel|remux)\b""").containsMatchIn(lower) -> HdrFormat.DV_P7_MEL_FEL
+                    Regex("""\b(p5|dv5)\b""").containsMatchIn(lower) -> HdrFormat.DV_P5
+                    Regex("""\b(p8\.4|hlg)\b""").containsMatchIn(lower) -> HdrFormat.DV_P8_4
+                    else -> HdrFormat.DV_P8_1
                 }
                 hasHdr10PlusSei -> HdrFormat.HDR10_PLUS
                 colorTransfer == MediaFormat.COLOR_TRANSFER_ST2084 -> HdrFormat.HDR10_PQ
                 colorTransfer == MediaFormat.COLOR_TRANSFER_HLG -> HdrFormat.HLG
-                else -> {
-                    val lower = hintName.lowercase()
-                    when {
-                        "dv.p7" in lower || "profile.7" in lower || "fel" in lower -> HdrFormat.DV_P7_MEL_FEL
-                        "dv.p5" in lower || "profile.5" in lower -> HdrFormat.DV_P5
-                        "hdr10+" in lower || "hdr10plus" in lower -> HdrFormat.HDR10_PLUS
-                        "hlg" in lower -> HdrFormat.HLG
-                        "hdr10" in lower || "2160p" in lower && "hdr" in lower -> HdrFormat.HDR10_PQ
-                        else -> HdrFormat.SDR
-                    }
+                else -> when {
+                    Regex("""\b(dv\.?p7|profile\.?7|fel)\b""").containsMatchIn(lower) -> HdrFormat.DV_P7_MEL_FEL
+                    Regex("""\b(dv\.?p5|profile\.?5)\b""").containsMatchIn(lower) -> HdrFormat.DV_P5
+                    "hdr10+" in lower || "hdr10plus" in lower -> HdrFormat.HDR10_PLUS
+                    Regex("""\bhlg\b""").containsMatchIn(lower) -> HdrFormat.HLG
+                    Regex("""\bhdr10\b""").containsMatchIn(lower) -> HdrFormat.HDR10_PQ
+                    else -> HdrFormat.SDR
                 }
             }
         }
     }
 
-    /**
-     * Scans MP4/MKV header bytes for `dvcC` or `dvvC` Dolby Vision configuration box:
-     * byte[0] = dv_version_major, byte[1] = dv_version_minor,
-     * byte[2] = (dv_profile << 1) | (dv_level >> 5),
-     * byte[4] upper nibble = dv_bl_signal_compatibility_id
-     */
     fun parseDvcCOrDvvC(bytes: ByteArray): Pair<Int, Int>? {
         if (bytes.size < 12) return null
         val tags = arrayOf("dvcC".encodeToByteArray(), "dvvC".encodeToByteArray())
@@ -196,30 +186,29 @@ class MediaFormatProber(private val context: Context) {
                     bytes[i + 2] == tag[2] && bytes[i + 3] == tag[3]
                 ) {
                     val base = i + 4
+                    val verMajor = bytes[base].toInt() and 0xFF
+                    val verMinor = bytes[base + 1].toInt() and 0xFF
+                    if (verMajor != 1 || verMinor != 0) continue
                     val b2 = bytes[base + 2].toInt() and 0xFF
                     val dvProfile = (b2 ushr 1) and 0x7F
                     val b4 = bytes[base + 4].toInt() and 0xFF
                     val blCompatId = (b4 ushr 4) and 0x0F
-                    if (dvProfile in 1..10) {
-                        return dvProfile to blCompatId
-                    }
+                    if (dvProfile in 1..10) return dvProfile to blCompatId
                 }
             }
         }
         return null
     }
 
-    /**
-     * Detects ITU-T T.35 country code 0xB5 + provider 0x003C + provider_oriented 0x0001 (SMPTE ST 2094-40 HDR10+).
-     */
     fun containsHdr10PlusBytes(bytes: ByteArray): Boolean {
-        if (bytes.size < 6) return false
-        for (i in 0..bytes.size - 6) {
+        if (bytes.size < 7) return false
+        for (i in 0..bytes.size - 7) {
             if ((bytes[i].toInt() and 0xFF) == 0xB5 &&
                 (bytes[i + 1].toInt() and 0xFF) == 0x00 &&
                 (bytes[i + 2].toInt() and 0xFF) == 0x3C &&
                 (bytes[i + 3].toInt() and 0xFF) == 0x00 &&
-                (bytes[i + 4].toInt() and 0xFF) == 0x01
+                (bytes[i + 4].toInt() and 0xFF) == 0x01 &&
+                (bytes[i + 5].toInt() and 0xFF) == 0x04
             ) {
                 return true
             }
@@ -247,8 +236,13 @@ class MediaFormatProber(private val context: Context) {
                 }
                 "content" -> context.contentResolver.openInputStream(uri)?.use { input ->
                     val buf = ByteArray(maxBytes)
-                    val read = input.read(buf)
-                    if (read > 0) buf.copyOf(read) else ByteArray(0)
+                    var total = 0
+                    while (total < maxBytes) {
+                        val read = input.read(buf, total, maxBytes - total)
+                        if (read <= 0) break
+                        total += read
+                    }
+                    buf.copyOf(total)
                 } ?: ByteArray(0)
                 else -> ByteArray(0)
             }
@@ -258,7 +252,7 @@ class MediaFormatProber(private val context: Context) {
     }
 
     private fun detectContainer(uri: String): String {
-        val clean = uri.substringBefore('?').lowercase()
+        val clean = uri.substringBefore('?').lowercase(Locale.ROOT)
         return when {
             clean.endsWith(".mkv") -> "MKV"
             clean.endsWith(".mp4") || clean.endsWith(".m4v") -> "MP4"
@@ -269,12 +263,32 @@ class MediaFormatProber(private val context: Context) {
         }
     }
 
-    private fun MediaFormat.getIntOrDefault(key: String, default: Int): Int =
-        if (containsKey(key)) getInteger(key) else default
+    private fun MediaFormat.getIntSafe(key: String, default: Int): Int {
+        if (!containsKey(key)) return default
+        return when (getValueTypeForKey(key)) {
+            MediaFormat.TYPE_INTEGER -> getInteger(key)
+            MediaFormat.TYPE_FLOAT -> getFloat(key).toInt()
+            MediaFormat.TYPE_LONG -> getLong(key).toInt()
+            else -> default
+        }
+    }
 
-    private fun MediaFormat.getFloatOrDefault(key: String, default: Float): Float =
-        if (containsKey(key)) getFloat(key) else default
+    private fun MediaFormat.getFloatSafe(key: String, default: Float): Float {
+        if (!containsKey(key)) return default
+        return when (getValueTypeForKey(key)) {
+            MediaFormat.TYPE_FLOAT -> getFloat(key)
+            MediaFormat.TYPE_INTEGER -> getInteger(key).toFloat()
+            MediaFormat.TYPE_LONG -> getLong(key).toFloat()
+            else -> default
+        }
+    }
 
-    private fun MediaFormat.getLongOrDefault(key: String, default: Long): Long =
-        if (containsKey(key)) getLong(key) else default
+    private fun MediaFormat.getLongSafe(key: String, default: Long): Long {
+        if (!containsKey(key)) return default
+        return when (getValueTypeForKey(key)) {
+            MediaFormat.TYPE_LONG -> getLong(key)
+            MediaFormat.TYPE_INTEGER -> getInteger(key).toLong()
+            else -> default
+        }
+    }
 }

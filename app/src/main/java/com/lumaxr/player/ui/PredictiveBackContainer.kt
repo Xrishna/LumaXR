@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -91,6 +92,16 @@ fun PredictiveBackContainer(
         label = "predictiveBackProgress",
     )
 
+    DisposableEffect(Unit) {
+        onDispose {
+            if (isDragging) {
+                isDragging = false
+                rawProgress = 0f
+                onSharedVisibilityChange(true)
+            }
+        }
+    }
+
     PredictiveBackHandler(enabled = enabled && effectiveStyle != PredictiveBackStyle.NONE) { progressFlow ->
         isDragging = true
         onSharedVisibilityChange(false) // Phase 1: suppress shared elements so ApproachLayout never fights detach scale
@@ -104,10 +115,17 @@ fun PredictiveBackContainer(
             rawProgress = 0f
             onSharedVisibilityChange(true)
             onBackCommitted()
-        } catch (_: CancellationException) {
+        } catch (e: CancellationException) {
             isDragging = false
             rawProgress = 0f
             onSharedVisibilityChange(true)
+            throw e
+        } finally {
+            if (isDragging) {
+                isDragging = false
+                rawProgress = 0f
+                onSharedVisibilityChange(true)
+            }
         }
     }
 

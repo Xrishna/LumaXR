@@ -1,14 +1,11 @@
 package com.lumaxr.player.music
 
+import androidx.media3.common.MimeTypes
 import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import com.lumaxr.player.hardware.RuanHardwareProfile
+import java.util.Locale
 
-/**
- * Custom Media3 MediaCodecSelector prioritizing verified Xiaomi Redmi Pad Pro 5G vendor Dolby HALs:
- * - c2.dolby.eac3.decoder (AC-3, E-AC-3, E-AC-3 JOC Atmos up to 16ch)
- * - c2.dolby.ac4.decoder  (Dolby AC-4 up to 16ch)
- */
 class DolbyAudioCodecSelector(
     private val delegate: MediaCodecSelector = MediaCodecSelector.DEFAULT,
 ) : MediaCodecSelector {
@@ -35,9 +32,10 @@ class DolbyAudioCodecSelector(
     }
 
     fun preferredCodecForMime(mimeType: String): String? {
-        return when (mimeType.lowercase()) {
-            "audio/ac3", "audio/eac3", "audio/eac3-joc" -> RuanHardwareProfile.CODEC_VENDOR_DOLBY_EAC3
-            "audio/ac4" -> RuanHardwareProfile.CODEC_VENDOR_DOLBY_AC4
+        return when (mimeType.lowercase(Locale.ROOT)) {
+            MimeTypes.AUDIO_AC3, MimeTypes.AUDIO_E_AC3, MimeTypes.AUDIO_E_AC3_JOC ->
+                RuanHardwareProfile.CODEC_VENDOR_DOLBY_EAC3
+            MimeTypes.AUDIO_AC4 -> RuanHardwareProfile.CODEC_VENDOR_DOLBY_AC4
             else -> null
         }
     }

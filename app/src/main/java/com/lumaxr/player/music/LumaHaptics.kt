@@ -4,15 +4,12 @@ import android.content.Context
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.os.VibratorManager
 
-/**
- * Android 16 (API 36) Richer Haptics using VibrationEffect.WaveformEnvelopeBuilder
- * gated on Vibrator.areEnvelopeEffectsSupported() and clamped to hardware VibratorEnvelopeEffectInfo
- * and VibratorFrequencyProfile, with clean API 34-35 VibrationEffect.Composition fallback.
- */
 class LumaHaptics(context: Context) {
 
-    private val vibrator: Vibrator? = context.getSystemService(Vibrator::class.java)
+    private val vibrator: Vibrator? = context.applicationContext
+        .getSystemService(VibratorManager::class.java)?.defaultVibrator
 
     fun playTactileClick() {
         val v = vibrator ?: return
@@ -22,22 +19,28 @@ class LumaHaptics(context: Context) {
                 val envInfo = v.envelopeEffectInfo
                 val freqProfile = v.frequencyProfile
                 val minFreq = freqProfile?.minFrequencyHz ?: 80f
-                val maxFreq = freqProfile?.maxFrequencyHz ?: 220f
-                val stepMs = (envInfo?.minControlPointDurationMillis ?: 10L).coerceAtLeast(10L)
+                val maxFreq = (freqProfile?.maxFrequencyHz ?: 220f).coerceAtLeast(minFreq)
+                val minStep = envInfo?.minControlPointDurationMillis ?: 10L
+                val maxStep = (envInfo?.maxControlPointDurationMillis ?: 100L).coerceAtLeast(minStep)
+                val stepMs = 12L.coerceIn(minStep, maxStep)
 
                 val effect = VibrationEffect.WaveformEnvelopeBuilder()
-                    .setInitialFrequencyHz(minFreq.coerceIn(60f, maxFreq))
+                    .setInitialFrequencyHz(minFreq)
                     .addControlPoint(0.85f, ((minFreq + maxFreq) * 0.55f).coerceIn(minFreq, maxFreq), stepMs)
-                    .addControlPoint(0.0f, minFreq.coerceIn(60f, maxFreq), stepMs)
+                    .addControlPoint(0.0f, minFreq, stepMs)
                     .build()
                 v.vibrate(effect)
                 return
             }
         }
-        val comp = VibrationEffect.startComposition()
-            .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, 0.7f)
-            .compose()
-        v.vibrate(comp)
+        if (v.areAllPrimitivesSupported(VibrationEffect.Composition.PRIMITIVE_CLICK)) {
+            val comp = VibrationEffect.startComposition()
+                .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, 0.7f)
+                .compose()
+            v.vibrate(comp)
+        } else {
+            v.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_CLICK))
+        }
     }
 
     fun playSeekDetent() {
@@ -48,20 +51,27 @@ class LumaHaptics(context: Context) {
                 val envInfo = v.envelopeEffectInfo
                 val freqProfile = v.frequencyProfile
                 val minFreq = freqProfile?.minFrequencyHz ?: 70f
-                val maxFreq = freqProfile?.maxFrequencyHz ?: 200f
-                val stepMs = (envInfo?.minControlPointDurationMillis ?: 8L).coerceAtLeast(8L)
+                val maxFreq = (freqProfile?.maxFrequencyHz ?: 200f).coerceAtLeast(minFreq)
+                val minStep = envInfo?.minControlPointDurationMillis ?: 8L
+                val maxStep = (envInfo?.maxControlPointDurationMillis ?: 100L).coerceAtLeast(minStep)
+                val stepMs = 10L.coerceIn(minStep, maxStep)
+
                 val effect = VibrationEffect.WaveformEnvelopeBuilder()
                     .setInitialFrequencyHz(minFreq)
-                    .addControlPoint(0.45f, (minFreq * 1.4f).coerceAtMost(maxFreq), stepMs)
+                    .addControlPoint(0.45f, (minFreq * 1.4f).coerceIn(minFreq, maxFreq), stepMs)
                     .addControlPoint(0.0f, minFreq, stepMs)
                     .build()
                 v.vibrate(effect)
                 return
             }
         }
-        val comp = VibrationEffect.startComposition()
-            .addPrimitive(VibrationEffect.Composition.PRIMITIVE_LOW_TICK, 0.45f)
-            .compose()
-        v.vibrate(comp)
+        if (v.areAllPrimitivesSupported(VibrationEffect.Composition.PRIMITIVE_LOW_TICK)) {
+            val comp = VibrationEffect.startComposition()
+                .addPrimitive(VibrationEffect.Composition.PRIMITIVE_LOW_TICK, 0.45f)
+                .compose()
+            v.vibrate(comp)
+        } else {
+            v.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK))
+        }
     }
 }

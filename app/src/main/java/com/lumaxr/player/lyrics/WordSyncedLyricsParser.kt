@@ -40,13 +40,6 @@ data class ParsedLyricsDocument(
     val providerAttribution: String = "",
 )
 
-/**
- * Multi-Format Word & Line-Synced Lyrics Parser:
- * - Full AMLL / Apple Music TTML (<p>, <span>, ttm:agent v1/v2/v1000, x-bg, x-translation, x-roman)
- * - Enhanced LRC (<mm:ss.xx>)
- * - NetEase YRC & QQ QRC
- * - Standard LRC with proportional character-weight synthetic sweep fallback
- */
 object WordSyncedLyricsParser {
 
     fun parseAuto(raw: String, providerAttribution: String = ""): ParsedLyricsDocument {
@@ -56,7 +49,8 @@ object WordSyncedLyricsParser {
         }
         return when {
             trimmed.startsWith("<") && trimmed.contains("<tt", ignoreCase = true) ->
-                parseTtml(trimmed, providerAttribution)
+                runCatching { parseTtml(trimmed, providerAttribution) }
+                    .getOrElse { ParsedLyricsDocument(emptyList(), false, false, "TTML_ERROR", providerAttribution = providerAttribution) }
             Regex("""\[\d+,\d+]\(\d+,\d+""").containsMatchIn(trimmed) ->
                 parseYrc(trimmed, providerAttribution)
             Regex("""\[\d+,\d+].*\(\d+,\d+\)""").containsMatchIn(trimmed) ->
@@ -78,6 +72,12 @@ object WordSyncedLyricsParser {
         }
     }
 
+    private data class SpanFrame(
+        val role: String?,
+        val startMs: Long,
+        val endMs: Long,
+    )
+
     fun parseTtml(xml: String, providerAttribution: String = ""): ParsedLyricsDocument {
         val lines = mutableListOf<LyricLine>()
         val songwriters = mutableListOf<String>()
@@ -94,12 +94,10 @@ object WordSyncedLyricsParser {
 
         var currentWords = mutableListOf<LyricWord>()
         var currentBgWords = mutableListOf<LyricWord>()
-        var currentTranslation: String? = null
-        var currentRoman: String? = null
+        val translationBuf = StringBuilder()
+        val romanBuf = StringBuilder()
 
-        var activeSpanRole: String? = null
-        var activeSpanStart = 0L
-        var activeSpanEnd = 0L
+        val spanStack = ArrayDeque<SpanFrame>()
         var inSongwriterTag = false
 
         var eventType = parser.eventType
@@ -113,7 +111,13 @@ object WordSyncedLyricsParser {
                         "p" -> if (inBody) {
                             inParagraph = true
                             pStartMs = parseTtmlTimestampMs(parser.getAttributeValue(null, "begin"))
-                            pEndMs = parseTtmlTimestampMs(parser.getAttributeValue(null, "end"))
+                            val rawEnd = parser.getAttributeValue(null, "end")
+                            val rawDur = parser.getAttributeValue(null, "dur")
+                            pEndMs = when {
+                                rawEnd != null -> parseTtmlTimestampMs(rawEnd)
+                                rawDur != null -> pStartMs + parseTtmlTimestampMs(rawDur)
+                                else -> 0L
+                            }
                             val agentAttr = parser.getAttributeValue(null, "ttm:agent")
                                 ?: parser.getAttributeValue(null, "agent")
                             pAgent = when (agentAttr?.lowercase()) {
@@ -123,25 +127,26 @@ object WordSyncedLyricsParser {
                             }
                             currentWords = mutableListOf()
                             currentBgWords = mutableListOf()
-                            currentTranslation = null
-                            currentRoman = null
+                            translationBuf.clear()
+                            romanBuf.clear()
+                            spanStack.clear()
                         }
                         "span" -> if (inParagraph) {
-                            val role = parser.getAttributeValue(null, "ttm:role")
-                                ?: parser.getAttributeValue(null, "role")
+                            val parent = spanStack.lastOrNull()
+                            val role = (parser.getAttributeValue(null, "ttm:role")
+                                ?: parser.getAttributeValue(null, "role"))?.lowercase()
+                                ?: parent?.role
                             val sBegin = parser.getAttributeValue(null, "begin")
                             val sEnd = parser.getAttributeValue(null, "end")
-                            if (role != null) {
-                                activeSpanRole = role.lowercase()
-                            }
-                            if (sBegin != null && sEnd != null) {
-                                activeSpanStart = parseTtmlTimestampMs(sBegin)
-                                activeSpanEnd = parseTtmlTimestampMs(sEnd)
+                            val startMs = if (sBegin != null) {
                                 hasWordSpans = true
-                            } else {
-                                activeSpanStart = pStartMs
-                                activeSpanEnd = pEndMs
-                            }
+                                parseTtmlTimestampMs(sBegin)
+                            } else parent?.startMs ?: pStartMs
+                            val endMs = if (sEnd != null) {
+                                hasWordSpans = true
+                                parseTtmlTimestampMs(sEnd)
+                            } else parent?.endMs ?: pEndMs
+                            spanStack.addLast(SpanFrame(role, startMs, endMs))
                         }
                     }
                 }
@@ -150,20 +155,19 @@ object WordSyncedLyricsParser {
                     if (inSongwriterTag && !txt.isNullOrBlank()) {
                         songwriters += txt.trim()
                     } else if (inParagraph && txt != null && txt.isNotEmpty()) {
-                        when (activeSpanRole) {
-                            "x-translation" -> currentTranslation = (currentTranslation.orEmpty() + txt).trim()
-                            "x-roman" -> currentRoman = (currentRoman.orEmpty() + txt).trim()
-                            "x-bg" -> {
-                                if (txt.isNotBlank() || currentBgWords.isNotEmpty()) {
-                                    currentBgWords += LyricWord(txt, activeSpanStart, activeSpanEnd.coerceAtLeast(activeSpanStart + 50L))
-                                }
+                        val top = spanStack.lastOrNull()
+                        when (top?.role) {
+                            "x-translation" -> translationBuf.append(txt)
+                            "x-roman" -> romanBuf.append(txt)
+                            "x-bg" -> if (txt.isNotBlank() || currentBgWords.isNotEmpty()) {
+                                val st = top.startMs
+                                val en = top.endMs.coerceAtLeast(st + 50L)
+                                currentBgWords += LyricWord(txt, st, en)
                             }
-                            else -> {
-                                if (txt.isNotBlank() || currentWords.isNotEmpty()) {
-                                    val st = if (activeSpanStart > 0L || activeSpanEnd > 0L) activeSpanStart else pStartMs
-                                    val en = if (activeSpanEnd > st) activeSpanEnd else pEndMs.coerceAtLeast(st + 100L)
-                                    currentWords += LyricWord(txt, st, en)
-                                }
+                            else -> if (txt.isNotBlank() || currentWords.isNotEmpty()) {
+                                val st = top?.startMs ?: pStartMs
+                                val en = (top?.endMs ?: pEndMs).coerceAtLeast(st + 60L)
+                                currentWords += LyricWord(txt, st, en)
                             }
                         }
                     }
@@ -172,27 +176,25 @@ object WordSyncedLyricsParser {
                     val name = parser.name.substringAfter(':').lowercase()
                     when (name) {
                         "songwriter" -> inSongwriterTag = false
-                        "span" -> {
-                            activeSpanRole = null
-                            activeSpanStart = 0L
-                            activeSpanEnd = 0L
-                        }
+                        "span" -> if (spanStack.isNotEmpty()) spanStack.removeLast()
                         "p" -> if (inParagraph) {
                             inParagraph = false
-                            val wordsFinal = if (currentWords.isNotEmpty()) currentWords else synthesizeProportionalWords(
-                                currentBgWords.joinToString("") { it.text },
-                                pStartMs,
-                                pEndMs,
-                            )
+                            val resolvedEnd = when {
+                                pEndMs > pStartMs -> pEndMs
+                                currentWords.isNotEmpty() -> currentWords.maxOf { it.endMs }
+                                else -> pStartMs + 2000L
+                            }
+                            val wordsFinal = if (currentWords.isNotEmpty()) currentWords
+                            else synthesizeProportionalWords(currentBgWords.joinToString("") { it.text }, pStartMs, resolvedEnd)
                             if (wordsFinal.isNotEmpty() || currentBgWords.isNotEmpty()) {
                                 lines += LyricLine(
                                     startMs = pStartMs,
-                                    endMs = pEndMs.coerceAtLeast(pStartMs + 200L),
+                                    endMs = resolvedEnd,
                                     agent = pAgent,
                                     words = wordsFinal,
                                     backgroundVocalWords = currentBgWords,
-                                    translation = currentTranslation,
-                                    romanization = currentRoman,
+                                    translation = translationBuf.toString().trim().takeIf { it.isNotEmpty() },
+                                    romanization = romanBuf.toString().trim().takeIf { it.isNotEmpty() },
                                 )
                             }
                         }
@@ -226,6 +228,11 @@ object WordSyncedLyricsParser {
             if (matches.isEmpty()) continue
 
             val words = mutableListOf<LyricWord>()
+            val prefix = body.substring(0, matches.first().range.first)
+            if (prefix.isNotBlank()) {
+                val firstTagMs = lrcTagToMs(matches.first().groupValues[1], matches.first().groupValues[2], matches.first().groupValues[3])
+                words += LyricWord(prefix, lineStart, firstTagMs.coerceAtLeast(lineStart + 40L))
+            }
             for (i in matches.indices) {
                 val m = matches[i]
                 val wStart = lrcTagToMs(m.groupValues[1], m.groupValues[2], m.groupValues[3])
@@ -242,7 +249,7 @@ object WordSyncedLyricsParser {
             if (words.isNotEmpty()) {
                 lines += LyricLine(
                     startMs = lineStart,
-                    endMs = words.last().endMs,
+                    endMs = words.last().endMs.coerceAtLeast(lineStart + 100L),
                     words = words,
                 )
             }
@@ -302,11 +309,10 @@ object WordSyncedLyricsParser {
                 val wd = m.groupValues[2].toLongOrNull() ?: 200L
                 LyricWord(m.groupValues[3], ws, ws + wd.coerceAtLeast(30L))
             }.toList()
-            if (words.isNotEmpty()) {
-                lines += LyricLine(start, start + dur, words = words)
-            }
+            if (words.isNotEmpty()) lines += LyricLine(start, start + dur, words = words)
         }
-        return ParsedLyricsDocument(lines, isSyllableSynced = true, isLineSynced = true, sourceFormat = "YRC", providerAttribution = providerAttribution)
+        val sorted = lines.sortedBy { it.startMs }
+        return ParsedLyricsDocument(sorted, isSyllableSynced = sorted.isNotEmpty(), isLineSynced = sorted.isNotEmpty(), sourceFormat = "YRC", providerAttribution = providerAttribution)
     }
 
     private fun parseQrc(raw: String, providerAttribution: String): ParsedLyricsDocument {
@@ -322,11 +328,10 @@ object WordSyncedLyricsParser {
                 val wd = m.groupValues[3].toLongOrNull() ?: 200L
                 LyricWord(m.groupValues[1], ws, ws + wd.coerceAtLeast(30L))
             }.toList()
-            if (words.isNotEmpty()) {
-                lines += LyricLine(start, start + dur, words = words)
-            }
+            if (words.isNotEmpty()) lines += LyricLine(start, start + dur, words = words)
         }
-        return ParsedLyricsDocument(lines, isSyllableSynced = true, isLineSynced = true, sourceFormat = "QRC", providerAttribution = providerAttribution)
+        val sorted = lines.sortedBy { it.startMs }
+        return ParsedLyricsDocument(sorted, isSyllableSynced = sorted.isNotEmpty(), isLineSynced = sorted.isNotEmpty(), sourceFormat = "QRC", providerAttribution = providerAttribution)
     }
 
     fun synthesizeProportionalWords(lineText: String, startMs: Long, endMs: Long): List<LyricWord> {
@@ -337,10 +342,10 @@ object WordSyncedLyricsParser {
         var cursor = startMs
         return tokens.mapIndexed { idx, tok ->
             val w = tok.trim().length.coerceAtLeast(1)
-            val slice = if (idx == tokens.lastIndex) (endMs - cursor).coerceAtLeast(30L)
-            else ((totalDur * w) / totalWeight).coerceAtLeast(30L)
-            val word = LyricWord(tok, cursor, cursor + slice)
-            cursor += slice
+            val slice = if (idx == tokens.lastIndex) (endMs - cursor).coerceAtLeast(1L)
+            else ((totalDur * w) / totalWeight).coerceAtLeast(1L)
+            val word = LyricWord(tok, cursor, (cursor + slice).coerceAtMost(endMs))
+            cursor = word.endMs
             word
         }
     }
@@ -348,12 +353,21 @@ object WordSyncedLyricsParser {
     fun parseTtmlTimestampMs(ts: String?): Long {
         if (ts.isNullOrBlank()) return 0L
         val s = ts.trim()
+        if (s.endsWith("ms", ignoreCase = true)) {
+            return s.dropLast(2).toDoubleOrNull()?.toLong() ?: 0L
+        }
         if (s.endsWith("s", ignoreCase = true) && !s.contains(":")) {
-            val sec = s.dropLast(1).toDoubleOrNull() ?: return 0L
-            return (sec * 1000.0).toLong()
+            return ((s.dropLast(1).toDoubleOrNull() ?: 0.0) * 1000.0).toLong()
         }
         val parts = s.split(':')
         return when (parts.size) {
+            4 -> {
+                val h = parts[0].toLongOrNull() ?: 0L
+                val m = parts[1].toLongOrNull() ?: 0L
+                val sec = parts[2].toLongOrNull() ?: 0L
+                val frames = parts[3].toLongOrNull() ?: 0L
+                ((h * 3600L + m * 60L + sec) * 1000L) + (frames * 1000L / 30L)
+            }
             3 -> {
                 val h = parts[0].toLongOrNull() ?: 0L
                 val m = parts[1].toLongOrNull() ?: 0L

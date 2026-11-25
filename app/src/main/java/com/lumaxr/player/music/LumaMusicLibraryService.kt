@@ -24,22 +24,20 @@ import androidx.media3.session.SessionResult
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import com.lumaxr.player.BuildConfig
 import com.lumaxr.player.LumaXrApplication
 import com.lumaxr.player.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.launch
 
 private val Context.resumptionStore by preferencesDataStore("lumaxr_resumption")
 
-/**
- * Official Media3 1.11.1 MediaLibraryService hosting audiophile playback, Android Auto / Wear OS
- * browsable MediaBrowser tree, custom media button preferences, ACTION_AUDIO_BECOMING_NOISY,
- * and 3-arg onPlaybackResumption(session, controller, isForPlayback) persistence.
- */
 class LumaMusicLibraryService : MediaLibraryService() {
 
     companion object {
@@ -51,8 +49,8 @@ class LumaMusicLibraryService : MediaLibraryService() {
         const val NODE_HIRES_DOLBY = "lumaxr_hires_dolby"
         const val NODE_PLAYLISTS = "lumaxr_playlists"
 
-        const val CMD_TOGGLE_FAVORITE = "com.lumaxr.player.CMD_FAVORITE"
-        const val CMD_CYCLE_REPEAT = "com.lumaxr.player.CMD_REPEAT"
+        val CMD_TOGGLE_FAVORITE = "${BuildConfig.APPLICATION_ID}.CMD_FAVORITE"
+        val CMD_CYCLE_REPEAT = "${BuildConfig.APPLICATION_ID}.CMD_REPEAT"
         private const val CHANNEL_ID = "lumaxr_music_playback"
         private val KEY_LAST_URI = stringPreferencesKey("last_uri")
         private val KEY_LAST_TITLE = stringPreferencesKey("last_title")
@@ -62,6 +60,7 @@ class LumaMusicLibraryService : MediaLibraryService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var mediaLibrarySession: MediaLibrarySession? = null
+    private var lastPersistedWriteMs = 0L
 
     private val noisyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -100,17 +99,22 @@ class LumaMusicLibraryService : MediaLibraryService() {
             .setMediaButtonPreferences(ImmutableList.of(favButton, repeatButton))
             .build()
 
-        // Persist active playback cursor for onPlaybackResumption()
         serviceScope.launch {
-            container.musicCoordinator.state.collect { st ->
-                val t = st.currentTrack ?: return@collect
-                resumptionStore.edit { prefs ->
-                    prefs[KEY_LAST_URI] = t.uri
-                    prefs[KEY_LAST_TITLE] = t.title
-                    prefs[KEY_LAST_ARTIST] = t.artist
-                    prefs[KEY_LAST_POS_MS] = st.positionMs
+            container.musicCoordinator.state
+                .distinctUntilChangedBy { Triple(it.currentTrack?.uri, it.isPlaying, it.positionMs / 5000L) }
+                .collect { st ->
+                    val t = st.currentTrack ?: return@collect
+                    val now = System.currentTimeMillis()
+                    if (!st.isPlaying || now - lastPersistedWriteMs >= 4500L) {
+                        lastPersistedWriteMs = now
+                        resumptionStore.edit { prefs ->
+                            prefs[KEY_LAST_URI] = t.uri
+                            prefs[KEY_LAST_TITLE] = t.title
+                            prefs[KEY_LAST_ARTIST] = t.artist
+                            prefs[KEY_LAST_POS_MS] = st.positionMs
+                        }
+                    }
                 }
-            }
         }
     }
 
@@ -120,6 +124,7 @@ class LumaMusicLibraryService : MediaLibraryService() {
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(noisyReceiver) }
+        serviceScope.cancel()
         mediaLibrarySession?.release()
         mediaLibrarySession = null
         super.onDestroy()
@@ -137,19 +142,17 @@ class LumaMusicLibraryService : MediaLibraryService() {
 
     private inner class LibraryCallback : MediaLibrarySession.Callback {
 
-        override fun onConnectAsync(
+        override fun onConnect(
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
-        ): ListenableFuture<MediaSession.ConnectionResult> {
+        ): MediaSession.ConnectionResult {
             val sessionCmds = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon()
                 .add(SessionCommand(CMD_TOGGLE_FAVORITE, Bundle.EMPTY))
                 .add(SessionCommand(CMD_CYCLE_REPEAT, Bundle.EMPTY))
                 .build()
-            return Futures.immediateFuture(
-                MediaSession.ConnectionResult.AcceptedResultBuilder(session)
-                    .setAvailableSessionCommands(sessionCmds)
-                    .build(),
-            )
+            return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailableSessionCommands(sessionCmds)
+                .build()
         }
 
         override fun onCustomCommand(
@@ -163,13 +166,24 @@ class LumaMusicLibraryService : MediaLibraryService() {
                 CMD_TOGGLE_FAVORITE -> {
                     val track = container.musicCoordinator.state.value.currentTrack
                     if (track != null) {
+                        val nextFav = !track.isFavorite
                         serviceScope.launch {
-                            container.database.musicLibraryDao().setFavorite(track.uri, !track.isFavorite)
+                            container.database.musicLibraryDao().setFavorite(track.uri, nextFav)
                         }
+                        val favIcon = if (nextFav) CommandButton.ICON_HEART_FILLED else CommandButton.ICON_HEART_UNFILLED
+                        val favBtn = CommandButton.Builder(favIcon)
+                            .setDisplayName("Favorite")
+                            .setSessionCommand(SessionCommand(CMD_TOGGLE_FAVORITE, Bundle.EMPTY))
+                            .build()
+                        val repBtn = CommandButton.Builder(CommandButton.ICON_REPEAT_ALL)
+                            .setDisplayName("Repeat")
+                            .setSessionCommand(SessionCommand(CMD_CYCLE_REPEAT, Bundle.EMPTY))
+                            .build()
+                        mediaLibrarySession?.setMediaButtonPreferences(ImmutableList.of(favBtn, repBtn))
                     }
                 }
                 CMD_CYCLE_REPEAT -> {
-                    // Handled by coordinator
+                    container.musicCoordinator.cycleRepeatMode()
                 }
             }
             return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
@@ -194,6 +208,16 @@ class LumaMusicLibraryService : MediaLibraryService() {
             return Futures.immediateFuture(LibraryResult.ofItem(root, params))
         }
 
+        override fun onGetItem(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            mediaId: String,
+        ): ListenableFuture<LibraryResult<MediaItem>> = serviceScope.future(Dispatchers.IO) {
+            val track = (application as LumaXrApplication).container.database.musicLibraryDao().getTrack(mediaId)
+            if (track != null) LibraryResult.ofItem(toPlayableItem(track), null)
+            else LibraryResult.ofError(LibraryResult.RESULT_ERROR_BAD_VALUE)
+        }
+
         override fun onGetChildren(
             session: MediaLibrarySession,
             browser: MediaSession.ControllerInfo,
@@ -203,8 +227,9 @@ class LumaMusicLibraryService : MediaLibraryService() {
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = serviceScope.future(Dispatchers.IO) {
             val dao = (application as LumaXrApplication).container.database.musicLibraryDao()
-            val items: List<MediaItem> = when (parentId) {
-                ROOT_ID -> listOf(
+            val all = dao.getAllTracks()
+            val items: List<MediaItem> = when {
+                parentId == ROOT_ID -> listOf(
                     browsableFolder(NODE_RECENT, "Recently Played"),
                     browsableFolder(NODE_ALBUMS, "Albums"),
                     browsableFolder(NODE_ARTISTS, "Artists"),
@@ -212,16 +237,23 @@ class LumaMusicLibraryService : MediaLibraryService() {
                     browsableFolder(NODE_HIRES_DOLBY, "Hi-Res & Dolby"),
                     browsableFolder(NODE_PLAYLISTS, "Playlists"),
                 )
-                NODE_HIRES_DOLBY -> dao.getAllTracks()
+                parentId == NODE_HIRES_DOLBY -> all
                     .filter { it.isDolbyAtmos || it.isDolbyAc4 || it.sampleRateHz > 48000 || it.bitDepth > 16 || it.isDsd }
                     .map { toPlayableItem(it) }
-                NODE_RECENT -> dao.getAllTracks()
-                    .sortedByDescending { it.lastPlayedMs }
-                    .take(30)
-                    .map { toPlayableItem(it) }
-                else -> dao.getAllTracks().map { toPlayableItem(it) }
+                parentId == NODE_RECENT -> all.sortedByDescending { it.lastPlayedMs }.take(30).map { toPlayableItem(it) }
+                parentId == NODE_ALBUMS -> all.map { it.album }.distinct().map { browsableFolder("album:$it", it) }
+                parentId == NODE_ARTISTS -> all.map { it.artist }.distinct().map { browsableFolder("artist:$it", it) }
+                parentId == NODE_FOLDERS -> all.map { it.folderPath }.distinct().map { browsableFolder("folder:$it", it.substringAfterLast('/')) }
+                parentId == NODE_PLAYLISTS -> dao.getAllPlaylists().map { browsableFolder("playlist:${it.playlistId}", it.name) }
+                parentId.startsWith("album:") -> all.filter { it.album == parentId.removePrefix("album:") }.map { toPlayableItem(it) }
+                parentId.startsWith("artist:") -> all.filter { it.artist == parentId.removePrefix("artist:") }.map { toPlayableItem(it) }
+                parentId.startsWith("folder:") -> all.filter { it.folderPath == parentId.removePrefix("folder:") }.map { toPlayableItem(it) }
+                else -> all.map { toPlayableItem(it) }
             }
-            LibraryResult.ofItemList(ImmutableList.copyOf(items), params)
+            val safeSize = pageSize.coerceAtLeast(1)
+            val from = (page * safeSize).coerceAtMost(items.size)
+            val to = (from + safeSize).coerceAtMost(items.size)
+            LibraryResult.ofItemList(ImmutableList.copyOf(items.subList(from, to)), params)
         }
 
         override fun onPlaybackResumption(

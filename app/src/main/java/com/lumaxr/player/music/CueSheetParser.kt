@@ -1,6 +1,7 @@
 package com.lumaxr.player.music
 
 import java.nio.charset.Charset
+import java.util.Locale
 
 data class CueTrackEntry(
     val trackNumber: Int,
@@ -12,13 +13,6 @@ data class CueTrackEntry(
     val endMs: Long,
 )
 
-/**
- * Spec-compliant CUE sheet parser handling:
- * - UTF-8 BOM stripping (0xEF 0xBB 0xBF) + cp1252 / Shift-JIS fallback decoding
- * - Quoted & unquoted FILE paths with spaces
- * - REM DATE / GENRE / PERFORMER / TITLE
- * - 75 fps CD frame-to-millisecond conversion (MM:SS:FF) and INDEX 00 / INDEX 01 pregap math
- */
 object CueSheetParser {
 
     fun decodeWithFallback(bytes: ByteArray): String {
@@ -56,22 +50,23 @@ object CueSheetParser {
         var activeTrack: RawTrack? = null
 
         for (line in lines) {
-            val upper = line.uppercase()
+            val normalized = line.replace(Regex("\\s+"), " ")
+            val upper = normalized.uppercase(Locale.ROOT)
             when {
                 upper.startsWith("TITLE ") && activeTrack == null -> {
-                    albumTitle = unquote(line.substringAfter(' '))
+                    albumTitle = unquote(normalized.substringAfter(' '))
                 }
                 upper.startsWith("PERFORMER ") && activeTrack == null -> {
-                    albumPerformer = unquote(line.substringAfter(' '))
+                    albumPerformer = unquote(normalized.substringAfter(' '))
                 }
                 upper.startsWith("FILE ") -> {
-                    currentFile = parseFileToken(line.substringAfter(' '))
-                    if (!currentFile.startsWith("/") && cueParentDir.isNotBlank()) {
+                    currentFile = parseFileToken(normalized.substringAfter(' '))
+                    if (currentFile.isNotBlank() && !currentFile.startsWith("/") && cueParentDir.isNotBlank()) {
                         currentFile = "$cueParentDir/$currentFile"
                     }
                 }
                 upper.startsWith("TRACK ") -> {
-                    val num = line.split(Regex("\\s+")).getOrNull(1)?.toIntOrNull() ?: (tracks.size + 1)
+                    val num = normalized.split(' ').getOrNull(1)?.toIntOrNull() ?: (tracks.size + 1)
                     activeTrack = RawTrack(
                         number = num,
                         title = "Track $num",
@@ -81,24 +76,23 @@ object CueSheetParser {
                     tracks += activeTrack
                 }
                 upper.startsWith("TITLE ") && activeTrack != null -> {
-                    activeTrack.title = unquote(line.substringAfter(' '))
+                    activeTrack.title = unquote(normalized.substringAfter(' '))
                 }
                 upper.startsWith("PERFORMER ") && activeTrack != null -> {
-                    activeTrack.performer = unquote(line.substringAfter(' '))
+                    activeTrack.performer = unquote(normalized.substringAfter(' '))
                 }
                 upper.startsWith("INDEX 01 ") && activeTrack != null -> {
-                    val ts = line.substringAfter("01").trim()
+                    val ts = normalized.substringAfter("INDEX 01 ").trim()
                     activeTrack.index01Ms = parseCdTimestampMs(ts)
                 }
                 upper.startsWith("INDEX 00 ") && activeTrack != null && activeTrack.index01Ms < 0L -> {
-                    // Fallback if INDEX 01 is omitted
-                    val ts = line.substringAfter("00").trim()
+                    val ts = normalized.substringAfter("INDEX 00 ").trim()
                     activeTrack.index01Ms = parseCdTimestampMs(ts)
                 }
             }
         }
 
-        val valid = tracks.filter { it.index01Ms >= 0L }
+        val valid = tracks.filter { it.index01Ms >= 0L && it.file.isNotBlank() }
         return valid.mapIndexed { idx, t ->
             val nextSameFile = valid.getOrNull(idx + 1)?.takeIf { it.file == t.file }
             val endMs = nextSameFile?.index01Ms ?: audioDurationMs

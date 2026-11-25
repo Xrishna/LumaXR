@@ -2,6 +2,8 @@ package com.lumaxr.player.data
 
 import android.content.Context
 import android.net.Uri
+import androidx.room.withTransaction
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
@@ -25,14 +27,11 @@ data class LumaFullBackupPayload(
     val shaderTogglesJson: String = "{}",
 )
 
-/**
- * 1-tap JSON/ZIP Config Export & Import so CI APK reinstalls / dynamic package ID changes
- * never lose per-folder XR rules, mpv.conf, shader/glow toggles, playlists, EQ profiles, or stats.
- */
 class ConfigBackupManager(
-    private val context: Context,
+    context: Context,
     private val db: LumaDatabase,
 ) {
+    private val appContext = context.applicationContext
     private val json = Json {
         prettyPrint = true
         ignoreUnknownKeys = true
@@ -40,9 +39,9 @@ class ConfigBackupManager(
     }
 
     suspend fun exportBackupZip(destinationUri: Uri? = null): File = withContext(Dispatchers.IO) {
-        val mpvConfFile = File(context.filesDir, "mpv_config/mpv.conf")
+        val mpvConfFile = File(appContext.filesDir, "mpv_config/mpv.conf")
         val mpvConfText = if (mpvConfFile.exists()) mpvConfFile.readText() else ""
-        val shaderPrefs = context.getSharedPreferences("lumaxr_visual_studio", Context.MODE_PRIVATE)
+        val shaderPrefs = appContext.getSharedPreferences("lumaxr_visual_studio", Context.MODE_PRIVATE)
         val shaderJson = shaderPrefs.getString("glow_config_json", "{}") ?: "{}"
 
         val payload = LumaFullBackupPayload(
@@ -50,12 +49,12 @@ class ConfigBackupManager(
             videoBookmarks = db.bookmarkDao().getAllBookmarks(),
             deviceEqProfiles = db.musicLibraryDao().getAllDeviceEqProfiles(),
             playlists = db.musicLibraryDao().getAllPlaylists(),
-            listeningEvents = db.listeningStatsDao().getRecentEvents(),
+            listeningEvents = db.listeningStatsDao().getAllEvents(),
             customMpvConf = mpvConfText,
             shaderTogglesJson = shaderJson,
         )
 
-        val outFile = File(context.cacheDir, "lumaxr_backup_${System.currentTimeMillis()}.zip")
+        val outFile = File(appContext.cacheDir, "lumaxr_backup_${System.currentTimeMillis()}.zip")
         ZipOutputStream(outFile.outputStream().buffered()).use { zip ->
             zip.putNextEntry(ZipEntry("lumaxr_backup.json"))
             zip.write(json.encodeToString(payload).encodeToByteArray())
@@ -69,16 +68,17 @@ class ConfigBackupManager(
         }
 
         if (destinationUri != null) {
-            context.contentResolver.openOutputStream(destinationUri)?.use { os ->
-                outFile.inputStream().use { it.copyTo(os) }
-            }
+            val os = appContext.contentResolver.openOutputStream(destinationUri)
+                ?: error("Cannot open output stream for backup destination")
+            os.use { out -> outFile.inputStream().use { it.copyTo(out) } }
+            outFile.delete()
         }
         outFile
     }
 
     suspend fun importBackup(sourceUri: Uri): Result<LumaFullBackupPayload> = withContext(Dispatchers.IO) {
-        runCatching {
-            val rawBytes = context.contentResolver.openInputStream(sourceUri)?.use { it.readBytes() }
+        try {
+            val rawBytes = appContext.contentResolver.openInputStream(sourceUri)?.use { it.readBytes() }
                 ?: error("Cannot open backup URI")
 
             val jsonString: String = if (rawBytes.size >= 2 && rawBytes[0] == 0x50.toByte() && rawBytes[1] == 0x4B.toByte()) {
@@ -86,7 +86,7 @@ class ConfigBackupManager(
                 ZipInputStream(rawBytes.inputStream()).use { zis ->
                     var entry = zis.nextEntry
                     while (entry != null) {
-                        if (entry.name.endsWith("lumaxr_backup.json")) {
+                        if (entry.name == "lumaxr_backup.json") {
                             extracted = zis.readBytes().decodeToString()
                             break
                         }
@@ -99,25 +99,34 @@ class ConfigBackupManager(
             }
 
             val payload = json.decodeFromString<LumaFullBackupPayload>(jsonString)
-            db.folderConfigDao().upsertAll(payload.folderVideoConfigs)
-            db.bookmarkDao().insertBookmarks(payload.videoBookmarks)
-            db.musicLibraryDao().upsertAllDeviceEqProfiles(payload.deviceEqProfiles)
-            db.musicLibraryDao().upsertAllPlaylists(payload.playlists)
-            if (payload.listeningEvents.isNotEmpty()) {
-                db.listeningStatsDao().insertAll(payload.listeningEvents)
+            db.withTransaction {
+                db.folderConfigDao().upsertAll(payload.folderVideoConfigs)
+                db.bookmarkDao().insertBookmarks(payload.videoBookmarks.map { it.copy(id = 0) })
+                db.musicLibraryDao().upsertAllDeviceEqProfiles(payload.deviceEqProfiles)
+                db.musicLibraryDao().upsertAllPlaylists(payload.playlists)
+                if (payload.listeningEvents.isNotEmpty()) {
+                    db.listeningStatsDao().insertAll(payload.listeningEvents.map { it.copy(id = 0) })
+                }
             }
 
+            val mpvDir = File(appContext.filesDir, "mpv_config").apply { mkdirs() }
+            val mpvFile = File(mpvDir, "mpv.conf")
             if (payload.customMpvConf.isNotBlank()) {
-                val mpvDir = File(context.filesDir, "mpv_config").apply { mkdirs() }
-                File(mpvDir, "mpv.conf").writeText(payload.customMpvConf)
+                mpvFile.writeText(payload.customMpvConf)
+            } else if (mpvFile.exists()) {
+                mpvFile.delete()
             }
             if (payload.shaderTogglesJson.isNotBlank()) {
-                context.getSharedPreferences("lumaxr_visual_studio", Context.MODE_PRIVATE)
+                appContext.getSharedPreferences("lumaxr_visual_studio", Context.MODE_PRIVATE)
                     .edit()
                     .putString("glow_config_json", payload.shaderTogglesJson)
-                    .apply()
+                    .commit()
             }
-            payload
+            Result.success(payload)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            Result.failure(t)
         }
     }
 }

@@ -3,7 +3,6 @@ package com.lumaxr.player.video
 import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
-import android.os.Build
 import android.view.SurfaceView
 import com.lumaxr.player.hardware.BacklightXrState
 import com.lumaxr.player.hardware.DisplayRefreshRateManager
@@ -22,7 +21,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.File
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.lang.ref.WeakReference
+import kotlin.math.abs
 
 data class VideoHudTelemetry(
     val engineLabel: String = "MPV Vulkan",
@@ -40,10 +43,6 @@ data class VideoHudTelemetry(
     val experimentalHbmWarning: String? = null,
 )
 
-/**
- * Coordinates Dual-Engine Video Playback (libmpv+libplacebo primary + Hard-Gated Media3 Dolby HAL fallback),
- * Vulkan->GLES 3.2 persistent fallback, RuanBacklightController, DisplayRefreshRateManager, and ThermalGovernor.
- */
 class DualEngineCoordinator(
     private val context: Context,
     private val scope: CoroutineScope,
@@ -61,6 +60,7 @@ class DualEngineCoordinator(
         get() = !prefs.getBoolean("force_gles_fallback", false)
         set(value) { prefs.edit().putBoolean("force_gles_fallback", !value).apply() }
 
+    private val playbackMutex = Mutex()
     private val _hudTelemetry = MutableStateFlow(VideoHudTelemetry())
     val hudTelemetry: StateFlow<VideoHudTelemetry> = _hudTelemetry.asStateFlow()
 
@@ -78,6 +78,7 @@ class DualEngineCoordinator(
     private var syncJob: Job? = null
     private var splitWipe: Float = 1.0f
     private var bypassOriginal: Boolean = false
+    private var lastAppliedBrightness: Float = -1f
 
     val mpvEngine = MpvPlaceboEngine(
         context = context,
@@ -85,7 +86,7 @@ class DualEngineCoordinator(
         onVulkanInitFailed = {
             useVulkan = false
             val uri = currentUri
-            val view = currentSurfaceView
+            val view = currentSurfaceView?.get()
             if (uri != null && view != null) {
                 scope.launch(Dispatchers.Main) {
                     startPlayback(view, uri, currentPreset, currentPolicy, EngineSwitchPreference.AUTO)
@@ -100,11 +101,17 @@ class DualEngineCoordinator(
     )
 
     val media3Engine = Media3DolbyHalEngine(context)
-    private var currentSurfaceView: SurfaceView? = null
-    private var attachedActivity: Activity? = null
+    private var currentSurfaceView: WeakReference<SurfaceView>? = null
+    private var attachedActivity: WeakReference<Activity>? = null
 
     fun bindActivity(activity: Activity) {
-        attachedActivity = activity
+        attachedActivity = WeakReference(activity)
+    }
+
+    fun unbindActivity(activity: Activity) {
+        if (attachedActivity?.get() === activity) {
+            attachedActivity = null
+        }
     }
 
     suspend fun startPlayback(
@@ -117,16 +124,17 @@ class DualEngineCoordinator(
         hdrToysMapper: HdrToysToneMapper = HdrToysToneMapper.OFF,
         subtitlePeakNits: Int = 140,
         manualTargetPeakNits: Float? = null,
-    ) {
+    ) = playbackMutex.withLock {
         currentUri = uri
-        currentSurfaceView = surfaceView
+        currentSurfaceView = WeakReference(surfaceView)
         currentPreset = preset
         currentPolicy = refreshPolicy
         thermalGovernor.start()
 
         val media = prober.probe(uri)
         _currentMedia.value = media
-        val displayCaps = guard.inspectDisplay(context)
+        val act = attachedActivity?.get()
+        val displayCaps = guard.inspectDisplay(act ?: context)
         val hasXrOrFilter = preset != XrPreset.RAW_BYPASS || hdrToysMapper != HdrToysToneMapper.OFF
         val decision = guard.evaluateRouting(
             media = media,
@@ -138,7 +146,7 @@ class DualEngineCoordinator(
         _activeEngineKind.value = decision.engine
 
         val estDisplayNits = RuanBacklightSpline.brightnessToNits(
-            attachedActivity?.window?.attributes?.screenBrightness?.takeIf { it > 0f } ?: 0.55f,
+            act?.window?.attributes?.screenBrightness?.takeIf { it > 0f } ?: 0.55f,
         )
 
         val plan = advisor.buildConfigPlan(
@@ -155,11 +163,12 @@ class DualEngineCoordinator(
         )
         currentPlan = plan
 
+        val enableXrBacklight = preset != XrPreset.RAW_BYPASS && decision.engine == VideoEngineKind.LIBMPV_PLACEBO_XR
         backlightController.configure(
             userCeilingNits = preset.defaultCeilingNits,
             dimmingFloorDMin = preset.dimmingFloorDMin,
             localContrastStrength = preset.localContrastDefault,
-            enabled = preset != XrPreset.RAW_BYPASS,
+            enabled = enableXrBacklight,
         )
 
         currentAspectState = smartAspectManager.computeLetterboxBounds(
@@ -168,22 +177,26 @@ class DualEngineCoordinator(
             currentAspectState,
         )
 
-        attachedActivity?.let { act ->
-            val lp = act.window.attributes
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                lp.desiredHdrHeadroom = plan.desiredHdrHeadroom
+        withContext(Dispatchers.Main) {
+            act?.let { a ->
+                val lp = a.window.attributes
+                lp.desiredHdrHeadroom = if (decision.engine == VideoEngineKind.MEDIA3_DOLBY_HAL) 0.0f else plan.desiredHdrHeadroom
+                if (!enableXrBacklight) {
+                    lp.screenBrightness = -1f
+                    lastAppliedBrightness = -1f
+                }
+                a.window.attributes = lp
+                val hz = refreshRateManager.applyToWindow(a, media.fps, refreshPolicy)
+                _hudTelemetry.value = _hudTelemetry.value.copy(refreshRateHz = hz)
             }
-            act.window.attributes = lp
-            val hz = refreshRateManager.applyToWindow(act, media.fps, refreshPolicy)
-            _hudTelemetry.value = _hudTelemetry.value.copy(refreshRateHz = hz)
-        }
 
-        if (decision.engine == VideoEngineKind.LIBMPV_PLACEBO_XR) {
-            media3Engine.destroy()
-            mpvEngine.attachAndStart(surfaceView, uri, plan)
-        } else {
-            mpvEngine.destroy()
-            media3Engine.attachAndStart(surfaceView, uri)
+            if (decision.engine == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+                media3Engine.destroy()
+                mpvEngine.attachAndStart(surfaceView, uri, plan)
+            } else {
+                mpvEngine.destroy()
+                media3Engine.attachAndStart(surfaceView, uri)
+            }
         }
 
         _hudTelemetry.value = _hudTelemetry.value.copy(
@@ -195,10 +208,14 @@ class DualEngineCoordinator(
             decoderLabel = if (decision.engine == VideoEngineKind.LIBMPV_PLACEBO_XR) {
                 if (media.videoCodec.contains("av1")) "dav1d SW" else plan.hwdec
             } else {
-                "c2.dolby"
+                media3Engine.telemetry.value.decoderName
             },
             formatLabel = media.hdrFormat.name.replace('_', ' '),
-            outputLabel = "${plan.targetPrim.uppercase()} / ${plan.targetTrc.uppercase()} / ${plan.targetPeakNits} nits",
+            outputLabel = if (decision.engine == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+                "${plan.targetPrim.uppercase()} / ${plan.targetTrc.uppercase()} / ${plan.targetPeakNits} nits"
+            } else {
+                "Native Dolby HAL Surface"
+            },
             routingReason = decision.reason,
             experimentalHbmWarning = plan.hbmWarningMessage,
         )
@@ -206,25 +223,63 @@ class DualEngineCoordinator(
         startTelemetryLoop()
     }
 
+    fun updateLiveMasteringOptions(
+        preset: XrPreset,
+        hdrToysMapper: HdrToysToneMapper,
+        subtitlePeakNits: Int,
+    ) {
+        currentPreset = preset
+        val media = _currentMedia.value ?: return
+        val act = attachedActivity?.get()
+        val displayCaps = guard.inspectDisplay(act ?: context)
+        val estDisplayNits = RuanBacklightSpline.brightnessToNits(
+            act?.window?.attributes?.screenBrightness?.takeIf { it > 0f } ?: 0.55f,
+        )
+        val plan = advisor.buildConfigPlan(
+            media = media,
+            preset = preset,
+            useVulkan = useVulkan,
+            estimatedDisplayNits = estDisplayNits,
+            manualTargetPeakNits = null,
+            experimentalHbmHdrMode = currentPlan?.targetColorspaceHint == "yes",
+            displayHighestHdrSdrRatio = displayCaps.highestHdrSdrRatio,
+            hdrToysMapper = hdrToysMapper,
+            subtitlePeakNits = subtitlePeakNits,
+            thermalTier = thermalGovernor.snapshot.value.tier,
+        )
+        currentPlan = plan
+        backlightController.configure(
+            userCeilingNits = preset.defaultCeilingNits,
+            dimmingFloorDMin = preset.dimmingFloorDMin,
+            localContrastStrength = preset.localContrastDefault,
+            enabled = preset != XrPreset.RAW_BYPASS && _activeEngineKind.value == VideoEngineKind.LIBMPV_PLACEBO_XR,
+        )
+        if (_activeEngineKind.value == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+            mpvEngine.applyRuntimePlanUpdate(plan)
+            updateBacklightAndUniforms(backlightController.state.value)
+        }
+    }
+
     private fun startTelemetryLoop() {
         syncJob?.cancel()
         syncJob = scope.launch(Dispatchers.Main) {
             while (isActive) {
+                val gov = thermalGovernor.snapshot.value
                 if (_activeEngineKind.value == VideoEngineKind.LIBMPV_PLACEBO_XR) {
                     val t = mpvEngine.telemetry.value
                     val isSwAv1Over1080 = t.videoCodec.contains("av1", ignoreCase = true) && t.videoHeight > 1080
                     thermalGovernor.updatePlaybackTelemetry(t.delayedFrames, t.droppedFrames, isSwAv1Over1080)
-                    val gov = thermalGovernor.snapshot.value
+                    val latestGov = thermalGovernor.snapshot.value
                     _hudTelemetry.value = _hudTelemetry.value.copy(
-                        thermalTier = gov.tier,
+                        thermalTier = latestGov.tier,
                         droppedFrames = t.droppedFrames,
                         decoderLabel = if (t.hwdecCurrent.isNotBlank()) t.hwdecCurrent else _hudTelemetry.value.decoderLabel,
                     )
                     currentPlan?.let { plan ->
-                        if (gov.tier.scalerOverride != null && plan.scaler != gov.tier.scalerOverride) {
+                        if (latestGov.tier.scalerOverride != null && plan.scaler != latestGov.tier.scalerOverride) {
                             val updated = plan.copy(
-                                scaler = gov.tier.scalerOverride,
-                                debandEnabled = plan.debandEnabled && gov.tier.allowDeband,
+                                scaler = latestGov.tier.scalerOverride,
+                                debandEnabled = plan.debandEnabled && latestGov.tier.allowDeband,
                             )
                             currentPlan = updated
                             mpvEngine.applyRuntimePlanUpdate(updated)
@@ -232,6 +287,11 @@ class DualEngineCoordinator(
                     }
                 } else {
                     media3Engine.refreshPosition()
+                    thermalGovernor.updatePlaybackTelemetry(0L, 0L, false)
+                    _hudTelemetry.value = _hudTelemetry.value.copy(
+                        thermalTier = gov.tier,
+                        decoderLabel = media3Engine.telemetry.value.decoderName,
+                    )
                 }
                 delay(250L)
             }
@@ -239,6 +299,7 @@ class DualEngineCoordinator(
     }
 
     private fun updateBacklightAndUniforms(xr: BacklightXrState) {
+        if (_activeEngineKind.value != VideoEngineKind.LIBMPV_PLACEBO_XR) return
         val govTier = thermalGovernor.snapshot.value.tier
         mpvEngine.applyLiveBacklightAndWipeUniforms(
             backlight = xr,
@@ -253,11 +314,14 @@ class DualEngineCoordinator(
             splitWipe = splitWipe,
             bypassOriginal = bypassOriginal,
         )
-        attachedActivity?.let { act ->
-            act.runOnUiThread {
-                val lp = act.window.attributes
-                lp.screenBrightness = xr.targetScreenBrightness
-                act.window.attributes = lp
+        if (xr.enabled && abs(xr.targetScreenBrightness - lastAppliedBrightness) >= 0.004f) {
+            lastAppliedBrightness = xr.targetScreenBrightness
+            attachedActivity?.get()?.let { act ->
+                act.runOnUiThread {
+                    val lp = act.window.attributes
+                    lp.screenBrightness = xr.targetScreenBrightness
+                    act.window.attributes = lp
+                }
             }
         }
     }
@@ -281,7 +345,7 @@ class DualEngineCoordinator(
         )
         if (_activeEngineKind.value == VideoEngineKind.LIBMPV_PLACEBO_XR) {
             mpvEngine.setVideoZoom(smartAspectManager.toMpvVideoZoom(currentAspectState, media?.width ?: 1920, media?.height ?: 1080))
-            mpvEngine.setSubPos(smartAspectManager.toMpvSubPos(subPlacement))
+            mpvEngine.setSubPos(smartAspectManager.toMpvSubPos(subPlacement, currentAspectState))
         }
         updateBacklightAndUniforms(backlightController.state.value)
     }
@@ -291,6 +355,38 @@ class DualEngineCoordinator(
             mpvEngine.setPaused(paused)
         } else {
             media3Engine.setPaused(paused)
+        }
+    }
+
+    fun isPaused(): Boolean {
+        return if (_activeEngineKind.value == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+            mpvEngine.telemetry.value.paused
+        } else {
+            !media3Engine.telemetry.value.isPlaying
+        }
+    }
+
+    fun currentPositionSec(): Double {
+        return if (_activeEngineKind.value == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+            mpvEngine.telemetry.value.positionSec
+        } else {
+            media3Engine.telemetry.value.positionMs / 1000.0
+        }
+    }
+
+    fun currentDurationSec(): Double {
+        return if (_activeEngineKind.value == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+            mpvEngine.telemetry.value.durationSec
+        } else {
+            media3Engine.telemetry.value.durationMs / 1000.0
+        }
+    }
+
+    fun seekToSec(seconds: Double) {
+        if (_activeEngineKind.value == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+            mpvEngine.seekToSeconds(seconds)
+        } else {
+            media3Engine.seekToMs((seconds * 1000.0).toLong())
         }
     }
 
@@ -305,17 +401,21 @@ class DualEngineCoordinator(
 
     fun stopAndRestoreDisplay() {
         syncJob?.cancel()
+        syncJob = null
+        currentUri = null
+        currentSurfaceView = null
+        lastAppliedBrightness = -1f
         thermalGovernor.stop()
         mpvEngine.destroy()
         media3Engine.destroy()
-        attachedActivity?.let { act ->
-            refreshRateManager.restore120Hz(act)
-            val lp = act.window.attributes
-            lp.screenBrightness = -1f
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        attachedActivity?.get()?.let { act ->
+            act.runOnUiThread {
+                refreshRateManager.restore120Hz(act)
+                val lp = act.window.attributes
+                lp.screenBrightness = -1f
                 lp.desiredHdrHeadroom = 0.0f
+                act.window.attributes = lp
             }
-            act.window.attributes = lp
         }
     }
 }

@@ -9,17 +9,13 @@ import android.os.SystemClock
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGL10
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.egl.EGLDisplay
 import javax.microedition.khronos.egl.EGLSurface
 import javax.microedition.khronos.opengles.GL10
 
-/**
- * 120 Hz Native Kawarp & MilkDrop GLES 3.2 Renderer using GL_RGBA16F float16 textures (glTexStorage2D),
- * Dual Kawase Blur (downsample + upsample), domain-warped fluid advection, MilkDrop ping-pong FBOs,
- * and blue-noise TPDF dithering into an sRGB EGL window surface.
- */
 class VisualStudioRenderer(
     private val context: Context,
     private val fftProvider: () -> AudioFftFrame,
@@ -70,7 +66,7 @@ class VisualStudioRenderer(
     private var width = 1280
     private var height = 800
     private var startTimeMs = SystemClock.uptimeMillis()
-    private var lastDrawMs = 0L
+    private var prevFrameMs = startTimeMs
     private var frameIndex = 0f
 
     private var progDown = 0
@@ -79,23 +75,33 @@ class VisualStudioRenderer(
     private var progMilk = 0
 
     private var sourceTex = 0
-    private var pendingBitmap: Bitmap? = null
-    private var accentColor = floatArrayOf(0.36f, 0.84f, 1.0f)
+    private var sourceTexW = 4
+    private var sourceTexH = 4
+    private val pendingBitmapRef = AtomicReference<Bitmap?>(null)
+    private val accentColorRef = AtomicReference(floatArrayOf(0.36f, 0.84f, 1.0f))
 
-    // FP16 ping-pong FBO textures (strictly separated read/write for Adreno 710 TBDR)
     private val fboIds = IntArray(2)
     private val texIds = IntArray(2)
     private var pingIdx = 0
 
     fun submitArtworkOrVideoFrame(bitmap: Bitmap, accentRgb: FloatArray? = null) {
-        pendingBitmap = bitmap
+        val uploadSafe = if (bitmap.config == Bitmap.Config.HARDWARE) {
+            bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        } else {
+            bitmap
+        }
+        pendingBitmapRef.set(uploadSafe)
         if (accentRgb != null && accentRgb.size == 3) {
-            accentColor = accentRgb
+            accentColorRef.set(accentRgb.copyOf())
         }
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         GLES32.glClearColor(0f, 0f, 0f, 1f)
+        fboIds.fill(0)
+        texIds.fill(0)
+        pingIdx = 0
+
         progDown = compileProgram(loadAsset("shaders/kawarp_downsample.glsl"))
         progUp = compileProgram(loadAsset("shaders/kawarp_kawase.glsl"))
         progWarp = compileProgram(loadAsset("shaders/kawarp_warp_glow.glsl"))
@@ -152,14 +158,15 @@ class VisualStudioRenderer(
 
     override fun onDrawFrame(gl: GL10?) {
         val maxFps = maxFpsProvider()
+        val nowMs = SystemClock.uptimeMillis()
+        val dtSec = ((nowMs - prevFrameMs).coerceIn(1L, 100L)) / 1000.0f
+        prevFrameMs = nowMs
+
         if (maxFps <= 0) {
+            GLES32.glViewport(0, 0, width, height)
             GLES32.glClear(GLES32.GL_COLOR_BUFFER_BIT)
             return
         }
-        val nowMs = SystemClock.uptimeMillis()
-        val minDeltaMs = 1000L / maxFps.coerceIn(15, 120)
-        if (nowMs - lastDrawMs < minDeltaMs) return
-        lastDrawMs = nowMs
 
         val cfg = configProvider().clamped()
         if (cfg.visualizerMode == VisualizerMode.MINIMAL_STATIC) {
@@ -168,40 +175,47 @@ class VisualStudioRenderer(
             return
         }
 
-        pendingBitmap?.let { bmp ->
-            pendingBitmap = null
+        pendingBitmapRef.getAndSet(null)?.let { bmp ->
             if (!bmp.isRecycled) {
+                sourceTexW = bmp.width.coerceAtLeast(1)
+                sourceTexH = bmp.height.coerceAtLeast(1)
                 GLES32.glBindTexture(GLES32.GL_TEXTURE_2D, sourceTex)
                 GLUtils.texImage2D(GLES32.GL_TEXTURE_2D, 0, bmp, 0)
             }
         }
 
         val fft = fftProvider()
-        val elapsedSec = (nowMs - startTimeMs) / 1000.0f
-        frameIndex += 1f
+        val accentColor = accentColorRef.get()
+        val elapsedSec = ((nowMs - startTimeMs) % 3_600_000L) / 1000.0f
+        frameIndex = (frameIndex + 1f) % 1024f
 
+        val compositeTexId: Int
         if (cfg.visualizerMode == VisualizerMode.MILKDROP_PLASMA) {
-            val readTex = texIds[pingIdx]
-            val writeFbo = fboIds[1 - pingIdx]
-            GLES32.glBindFramebuffer(GLES32.GL_FRAMEBUFFER, writeFbo)
+            val writeIdx = 1 - pingIdx
+            GLES32.glBindFramebuffer(GLES32.GL_FRAMEBUFFER, fboIds[writeIdx])
             GLES32.glViewport(0, 0, 256, 256)
             GLES32.glUseProgram(progMilk)
             GLES32.glActiveTexture(GLES32.GL_TEXTURE0)
-            GLES32.glBindTexture(GLES32.GL_TEXTURE_2D, readTex)
+            GLES32.glBindTexture(GLES32.GL_TEXTURE_2D, texIds[pingIdx])
             GLES32.glUniform1i(GLES32.glGetUniformLocation(progMilk, "u_prev_tex"), 0)
             GLES32.glUniform1f(GLES32.glGetUniformLocation(progMilk, "u_time"), elapsedSec)
+            GLES32.glUniform1f(GLES32.glGetUniformLocation(progMilk, "u_dt"), dtSec)
             GLES32.glUniform1i(GLES32.glGetUniformLocation(progMilk, "u_preset"), cfg.milkDropPreset.id)
             GLES32.glUniform1f(GLES32.glGetUniformLocation(progMilk, "u_bass"), fft.bass)
             GLES32.glUniform1f(GLES32.glGetUniformLocation(progMilk, "u_mid"), fft.mid)
             GLES32.glUniform1f(GLES32.glGetUniformLocation(progMilk, "u_treble"), fft.treble)
             GLES32.glUniform1f(GLES32.glGetUniformLocation(progMilk, "u_react"), cfg.beatReactivity)
             GLES32.glUniform3fv(GLES32.glGetUniformLocation(progMilk, "u_accent"), 1, accentColor, 0)
+            GLES32.glUniform2f(GLES32.glGetUniformLocation(progMilk, "u_resolution"), width.toFloat(), height.toFloat())
             drawQuad()
-            pingIdx = 1 - pingIdx
+            pingIdx = writeIdx
+            compositeTexId = texIds[pingIdx]
         } else {
-            // Dual Kawase Blur passes over GL_RGBA16F ping-pong targets
             var inputTex = sourceTex
+            var curW = sourceTexW
+            var curH = sourceTexH
             val passes = cfg.kawaseBlurPasses
+            var lastWriteTex = texIds[0]
             for (p in 0 until passes) {
                 val writeIdx = pingIdx
                 val prog = if (p < passes / 2) progDown else progUp
@@ -211,20 +225,23 @@ class VisualStudioRenderer(
                 GLES32.glActiveTexture(GLES32.GL_TEXTURE0)
                 GLES32.glBindTexture(GLES32.GL_TEXTURE_2D, inputTex)
                 GLES32.glUniform1i(GLES32.glGetUniformLocation(prog, "u_tex"), 0)
-                GLES32.glUniform2f(GLES32.glGetUniformLocation(prog, "u_half_pixel"), 1f / 512f, 1f / 512f)
+                GLES32.glUniform2f(GLES32.glGetUniformLocation(prog, "u_half_pixel"), 0.5f / curW, 0.5f / curH)
                 GLES32.glUniform1f(GLES32.glGetUniformLocation(prog, "u_offset"), 1f + p * 0.65f)
                 drawQuad()
-                inputTex = texIds[writeIdx]
+                lastWriteTex = texIds[writeIdx]
+                inputTex = lastWriteTex
+                curW = 256
+                curH = 256
                 pingIdx = 1 - pingIdx
             }
+            compositeTexId = lastWriteTex
         }
 
-        // Final Composite Pass -> sRGB Window Surface with domain warp + glow + TPDF dithering
         GLES32.glBindFramebuffer(GLES32.GL_FRAMEBUFFER, 0)
         GLES32.glViewport(0, 0, width, height)
         GLES32.glUseProgram(progWarp)
         GLES32.glActiveTexture(GLES32.GL_TEXTURE0)
-        GLES32.glBindTexture(GLES32.GL_TEXTURE_2D, texIds[1 - pingIdx])
+        GLES32.glBindTexture(GLES32.GL_TEXTURE_2D, compositeTexId)
         GLES32.glUniform1i(GLES32.glGetUniformLocation(progWarp, "u_tex"), 0)
         GLES32.glUniform1f(GLES32.glGetUniformLocation(progWarp, "u_time"), elapsedSec)
         GLES32.glUniform1f(GLES32.glGetUniformLocation(progWarp, "u_frame_index"), frameIndex)
