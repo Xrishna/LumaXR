@@ -116,7 +116,7 @@ class PlaybackConfigAdvisorTest {
             uri = "https://cdn.example/demo_4k_av1.mkv",
             title = "Demo 4K",
             container = "MKV",
-            hdrFormat = HdrFormat.HDR10,
+            hdrFormat = HdrFormat.HDR10_PQ,
             width = 3840,
             height = 2160,
             bitDepth = 10,
