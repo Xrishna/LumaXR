@@ -80,7 +80,7 @@ class DualEngineCoordinator(
     private var bypassOriginal: Boolean = false
     private var lastAppliedBrightness: Float = -1f
 
-    val mpvEngine = MpvPlaceboEngine(
+    val mpvEngine: MpvPlaceboEngine = MpvPlaceboEngine(
         context = context,
         scope = scope,
         onVulkanInitFailed = {
@@ -100,7 +100,7 @@ class DualEngineCoordinator(
         onAmbientFrameSampled = onAmbientFrameSampled,
     )
 
-    val media3Engine = Media3DolbyHalEngine(context)
+    val media3Engine: Media3DolbyHalEngine = Media3DolbyHalEngine(context)
     private var currentSurfaceView: WeakReference<SurfaceView>? = null
     private var attachedActivity: WeakReference<Activity>? = null
 
@@ -124,7 +124,8 @@ class DualEngineCoordinator(
         hdrToysMapper: HdrToysToneMapper = HdrToysToneMapper.OFF,
         subtitlePeakNits: Int = 140,
         manualTargetPeakNits: Float? = null,
-    ) = playbackMutex.withLock {
+    ): Unit {
+        playbackMutex.withLock {
         currentUri = uri
         currentSurfaceView = WeakReference(surfaceView)
         currentPreset = preset
@@ -221,6 +222,7 @@ class DualEngineCoordinator(
         )
 
         startTelemetryLoop()
+        }
     }
 
     fun updateLiveMasteringOptions(
