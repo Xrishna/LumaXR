@@ -1,4 +1,4 @@
-package com.lumaxr.player.ui
+package com.lumaxr.player
 
 import android.Manifest
 import android.content.Intent
@@ -17,8 +17,9 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.ui.graphics.Color
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
-import com.lumaxr.player.LumaXrApplication
 import com.lumaxr.player.pro.PipController
+import com.lumaxr.player.ui.LumaNavigationRoot
+import com.lumaxr.player.ui.MainViewModel
 import com.lumaxr.player.video.DesktopInputHandler
 
 class MainActivity : ComponentActivity() {

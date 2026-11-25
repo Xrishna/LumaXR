@@ -95,8 +95,8 @@ class AudioDeviceProfileRouter(
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
             .build()
-        val routed = runCatching { audioManager?.getDevicesForAttributes(mediaAttrs) }.getOrNull()
-        val outputs = if (!routed.isNullOrEmpty()) routed.toList()
+        val routed = runCatching { audioManager?.getAudioDevicesForAttributes(mediaAttrs) }.getOrNull()
+        val outputs = if (!routed.isNullOrEmpty()) routed
         else audioManager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.toList().orEmpty()
 
         val route = classifyRoute(outputs)
@@ -158,14 +158,10 @@ class AudioDeviceProfileRouter(
         )
     }
 
-    fun showSystemOutputSwitcher(platformToken: MediaSession.Token? = null): Boolean {
+    fun showSystemOutputSwitcher(@Suppress("UNUSED_PARAMETER") platformToken: MediaSession.Token? = null): Boolean {
         val router = MediaRouter2.getInstance(appContext)
         return runCatching {
-            if (platformToken != null) {
-                router.showSystemOutputSwitcher(platformToken)
-            } else {
-                router.showSystemOutputSwitcher()
-            }
+            router.showSystemOutputSwitcher()
         }.getOrDefault(false)
     }
 }

@@ -7,7 +7,8 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import com.lumaxr.player.hardware.BacklightXrState
 import com.lumaxr.player.hardware.FrameLuminanceMetrics
-import is.xyz.mpv.MPV
+import `is`.xyz.mpv.MPV
+import `is`.xyz.mpv.MPVNode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -421,9 +422,9 @@ class MpvPlaceboEngine(
         }
     }
 
-    override fun eventProperty(property: String, value: is.xyz.mpv.MPVNode) {}
+    override fun eventProperty(property: String, value: MPVNode) {}
 
-    override fun event(eventId: Int, data: is.xyz.mpv.MPVNode) {
+    override fun event(eventId: Int, data: MPVNode) {
         if (eventId == MPV.mpvEvent.MPV_EVENT_FILE_LOADED) {
             fileLoadedSuccessfully = true
         } else if (eventId == MPV.mpvEvent.MPV_EVENT_SHUTDOWN &&

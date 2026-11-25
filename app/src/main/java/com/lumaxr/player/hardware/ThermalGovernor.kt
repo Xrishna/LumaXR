@@ -2,9 +2,9 @@ package com.lumaxr.player.hardware
 
 import android.content.Context
 import android.os.Build
+import android.os.GpuHeadroomParams
 import android.os.PowerManager
 import android.os.SystemClock
-import android.os.health.GpuHeadroomParams
 import android.os.health.SystemHealthManager
 import androidx.annotation.RequiresApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -70,9 +70,10 @@ class ThermalGovernor(context: Context) {
                 currentThermalStatus = powerManager?.currentThermalStatus ?: PowerManager.THERMAL_STATUS_NONE
                 powerManager?.addThermalStatusListener(appContext.mainExecutor, thermalListener)
             }
-            if (Build.VERSION.SDK_INT >= 36 && systemHealthManager != null) {
+            val shm = systemHealthManager
+            if (Build.VERSION.SDK_INT >= 36 && shm != null) {
                 runCatching {
-                    gpuMinIntervalMs = systemHealthManager.gpuHeadroomMinIntervalMillis.coerceAtLeast(500L)
+                    gpuMinIntervalMs = shm.gpuHeadroomMinIntervalMillis.coerceAtLeast(500L)
                 }
             }
             recomputeTierLocked()
@@ -103,8 +104,9 @@ class ThermalGovernor(context: Context) {
             if (shouldPollGpu) lastGpuPollMs = nowMs
         }
 
-        if (shouldPollGpu && Build.VERSION.SDK_INT >= 36 && systemHealthManager != null) {
-            headroom = queryApi36GpuHeadroom(systemHealthManager)
+        val shm = systemHealthManager
+        if (shouldPollGpu && Build.VERSION.SDK_INT >= 36 && shm != null) {
+            headroom = queryApi36GpuHeadroom(shm)
         }
 
         synchronized(lock) {
@@ -129,7 +131,9 @@ class ThermalGovernor(context: Context) {
     private fun queryApi36GpuHeadroom(shm: SystemHealthManager): Float? {
         return try {
             val range = shm.gpuHeadroomCalculationWindowRange
-            val windowMs = 2000.coerceIn(range.lower, range.upper)
+            val minW = (range.first ?: 500).coerceAtLeast(1)
+            val maxW = (range.second ?: 10000).coerceAtLeast(minW)
+            val windowMs = 2000.coerceIn(minW, maxW)
             val params = GpuHeadroomParams.Builder()
                 .setCalculationType(GpuHeadroomParams.GPU_HEADROOM_CALCULATION_TYPE_AVERAGE)
                 .setCalculationWindowMillis(windowMs)

@@ -1,7 +1,8 @@
 package com.lumaxr.player.music
 
 import android.content.Context
-import is.xyz.mpv.MPV
+import `is`.xyz.mpv.MPV
+import `is`.xyz.mpv.MPVNode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -145,7 +146,7 @@ class MpvAudioEngine(
     override fun eventProperty(property: String) {}
     override fun eventProperty(property: String, value: Long) {}
     override fun eventProperty(property: String, value: String) {}
-    override fun eventProperty(property: String, value: is.xyz.mpv.MPVNode) {}
+    override fun eventProperty(property: String, value: MPVNode) {}
 
     override fun eventProperty(property: String, value: Boolean) {
         if (property == "pause") {
@@ -160,7 +161,7 @@ class MpvAudioEngine(
         }
     }
 
-    override fun event(eventId: Int, data: is.xyz.mpv.MPVNode) {
+    override fun event(eventId: Int, data: MPVNode) {
         if (eventId == MPV.mpvEvent.MPV_EVENT_END_FILE) {
             if (suppressNextEndFile) {
                 suppressNextEndFile = false
