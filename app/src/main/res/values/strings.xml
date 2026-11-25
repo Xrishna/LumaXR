@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">LumaXR</string>
+    <string name="music_widget_description">LumaXR Audiophile Now Playing Controls</string>
+    <string name="notification_channel_music">Audiophile Playback</string>
+</resources>

@@ -1,0 +1,43 @@
+package com.lumaxr.player
+
+import com.google.common.truth.Truth.assertThat
+import com.lumaxr.player.pro.RandomAccessByteSource
+import com.lumaxr.player.pro.RangeChunkCache
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import org.junit.Test
+import java.nio.file.Files
+
+class RangeChunkCacheTest {
+
+    @Test
+    fun readsExactCrossChunkRangesFromSourceAndCachesToDisk() {
+        val tempDir = Files.createTempDirectory("lumaxr_chunk_test").toFile()
+        val payload = ByteArray(5000) { idx -> (idx % 251).toByte() }
+        var readCalls = 0
+        val source = object : RandomAccessByteSource {
+            override val totalLength: Long = payload.size.toLong()
+            override fun readAt(offset: Long, buffer: ByteArray, length: Int): Int {
+                readCalls++
+                val avail = minOf(length, payload.size - offset.toInt())
+                System.arraycopy(payload, offset.toInt(), buffer, 0, avail)
+                return avail
+            }
+        }
+
+        val cache = RangeChunkCache(
+            cacheRoot = tempDir,
+            scope = CoroutineScope(Dispatchers.Unconfined),
+            chunkSizeBytes = 1024,
+            prefetchAheadChunks = 1,
+        )
+
+        val slice = cache.readRange("test_movie", source, offset = 900L, length = 500)
+        assertThat(slice).isEqualTo(payload.copyOfRange(900, 1400))
+
+        val callsAfterFirstRead = readCalls
+        val cachedSlice = cache.readRange("test_movie", source, offset = 950L, length = 300)
+        assertThat(cachedSlice).isEqualTo(payload.copyOfRange(950, 1250))
+        assertThat(readCalls).isEqualTo(callsAfterFirstRead)
+    }
+}
