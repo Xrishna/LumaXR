@@ -2,47 +2,47 @@
 //!HOOK OUTPUT
 //!BIND HOOKED
 //!PARAM u_inv_gain
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 1.0
 //!MAXIMUM 3.0
 1.0
 //!PARAM u_local_contrast
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.28
 //!PARAM u_bilateral_radius
-//!TYPE int
+//!TYPE DYNAMIC int
 //!MINIMUM 0
 //!MAXIMUM 4
 4
 //!PARAM u_letterbox_top
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 0.45
 0.0
 //!PARAM u_letterbox_bottom
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.55
 //!MAXIMUM 1.0
 1.0
 //!PARAM u_split_wipe
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 1.0
 //!PARAM u_bypass_original
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0
 //!PARAM u_bt1886_toe
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 0.02
 0.0008
 //!PARAM u_is_linear_bypass
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.0

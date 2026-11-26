@@ -1,10 +1,18 @@
 package com.lumaxr.player.ui
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.animation.SharedTransitionScope
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,22 +36,21 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.runtime.entryProvider
+import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
 import kotlinx.serialization.Serializable
@@ -75,29 +82,16 @@ fun isListOriginVisible(listState: LazyListState, key: Any): Boolean {
 }
 
 /**
- * Phase B Single-Root SharedTransitionLayout & Strict Overlay Z-Order:
- * - TopAppBar / MorphingSearchTopBar: zIndex(30f)
- * - Floating NavigationBar / MiniPlayer: zIndex(20f)
- * - Shared Hero Cards (clipInOverlayDuringTransition): zIndex(10f)
- * - Content: zIndex(0f)
+ * Phase B Single-Root SharedTransitionLayout & Navigation 3 Back Stack with non-conflicting
+ * Predictive Back transitions matching Android 16 NavigationEvent edge direction and Reduce Motion.
  */
 @Composable
 fun LumaNavigationRoot(
     viewModel: MainViewModel,
     externalVideoUri: String? = null,
 ) {
-    val backStack = remember {
-        mutableStateListOf<LumaRoute>(
-            if (!externalVideoUri.isNullOrBlank()) {
-                LumaRoute.VideoPlayer(
-                    externalVideoUri,
-                    externalVideoUri.substringAfterLast('/').ifBlank { "External Video" },
-                )
-            } else {
-                LumaRoute.VideoLibrary
-            },
-        )
-    }
+    val context = LocalContext.current
+    val backStack = rememberNavBackStack(LumaRoute.VideoLibrary)
 
     LaunchedEffect(externalVideoUri) {
         if (!externalVideoUri.isNullOrBlank()) {
@@ -105,7 +99,7 @@ fun LumaNavigationRoot(
             val alreadyOpen = top is LumaRoute.VideoPlayer && top.uri == externalVideoUri
             if (!alreadyOpen) {
                 if (top is LumaRoute.VideoPlayer && backStack.size > 1) {
-                    backStack.removeAt(backStack.lastIndex)
+                    backStack.removeLastOrNull()
                 }
                 backStack.add(
                     LumaRoute.VideoPlayer(
@@ -117,9 +111,9 @@ fun LumaNavigationRoot(
         }
     }
 
-    val backStyle by viewModel.backStyle.collectAsState()
-    val musicState by viewModel.container.musicCoordinator.state.collectAsState()
-    var isPredictiveDragging by remember { mutableStateOf(false) }
+    val backStyle by viewModel.backStyle.collectAsStateWithLifecycle()
+    val effectiveStyle = if (isReduceMotionEnabled(context)) PredictiveBackStyle.NONE else backStyle
+    val musicState by viewModel.container.musicCoordinator.state.collectAsStateWithLifecycle()
     val videoGridState = remember { LazyGridState() }
     val musicListState = remember { LazyListState() }
 
@@ -141,10 +135,41 @@ fun LumaNavigationRoot(
                     if (backStack.lastOrNull() is LumaRoute.VideoPlayer) {
                         viewModel.container.videoCoordinator.stopAndRestoreDisplay()
                     }
-                    if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
+                    if (backStack.size > 1) backStack.removeLastOrNull()
                 },
                 sharedTransitionScope = sharedScope,
                 entryDecorators = listOf(rememberSaveableStateHolderNavEntryDecorator()),
+                transitionSpec = {
+                    when (effectiveStyle) {
+                        PredictiveBackStyle.NONE -> EnterTransition.None togetherWith ExitTransition.None
+                        PredictiveBackStyle.MATERIAL_FADE_THROUGH -> fadeIn(tween(180)) togetherWith fadeOut(tween(140))
+                        PredictiveBackStyle.PREDICTIVE_DETACH_SHARED ->
+                            (fadeIn(tween(200)) + scaleIn(initialScale = 0.96f, animationSpec = tween(220))) togetherWith
+                                fadeOut(tween(150))
+                    }
+                },
+                popTransitionSpec = {
+                    when (effectiveStyle) {
+                        PredictiveBackStyle.NONE -> EnterTransition.None togetherWith ExitTransition.None
+                        PredictiveBackStyle.MATERIAL_FADE_THROUGH -> fadeIn(tween(180)) togetherWith fadeOut(tween(180))
+                        PredictiveBackStyle.PREDICTIVE_DETACH_SHARED ->
+                            fadeIn(tween(200)) togetherWith
+                                (scaleOut(targetScale = 0.90f, animationSpec = tween(220)) + fadeOut(tween(200)))
+                    }
+                },
+                predictivePopTransitionSpec = { swipeEdge ->
+                    when (effectiveStyle) {
+                        PredictiveBackStyle.NONE -> EnterTransition.None togetherWith ExitTransition.None
+                        PredictiveBackStyle.MATERIAL_FADE_THROUGH -> fadeIn(tween(180)) togetherWith fadeOut(tween(180))
+                        PredictiveBackStyle.PREDICTIVE_DETACH_SHARED -> {
+                            val dir = if (swipeEdge == 0) 1 else -1
+                            (fadeIn(tween(180)) + scaleIn(initialScale = 0.95f)) togetherWith
+                                (slideOutHorizontally(targetOffsetX = { w -> dir * (w / 5) }) +
+                                    scaleOut(targetScale = 0.88f) +
+                                    fadeOut(tween(200)))
+                        }
+                    }
+                },
                 modifier = Modifier
                     .fillMaxSize()
                     .zIndex(0f),
@@ -154,7 +179,7 @@ fun LumaNavigationRoot(
                             viewModel = viewModel,
                             gridState = videoGridState,
                             sharedScope = sharedScope,
-                            sharedElementsVisible = !isPredictiveDragging,
+                            sharedElementsVisible = true,
                             onOpenVideo = { item ->
                                 backStack.add(LumaRoute.VideoPlayer(item.uri, item.title))
                             },
@@ -182,55 +207,34 @@ fun LumaNavigationRoot(
                     }
                     entry<LumaRoute.VideoPlayer> { route ->
                         val originVisible = isGridOriginVisible(videoGridState, route.uri)
-                        PredictiveBackContainer(
-                            enabled = backStack.size > 1,
-                            style = backStyle,
-                            onSharedVisibilityChange = { vis ->
-                                isPredictiveDragging = !vis
-                            },
-                            onBackCommitted = {
+                        VideoPlayerScreen(
+                            uri = route.uri,
+                            title = route.title,
+                            viewModel = viewModel,
+                            sharedScope = sharedScope,
+                            sharedElementsVisible = originVisible && effectiveStyle == PredictiveBackStyle.PREDICTIVE_DETACH_SHARED,
+                            onExit = {
                                 viewModel.container.videoCoordinator.stopAndRestoreDisplay()
-                                if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
+                                if (backStack.size > 1) backStack.removeLastOrNull()
                             },
-                        ) {
-                            VideoPlayerScreen(
-                                uri = route.uri,
-                                title = route.title,
-                                viewModel = viewModel,
-                                sharedScope = sharedScope,
-                                sharedElementsVisible = !isPredictiveDragging && originVisible,
-                                onExit = {
-                                    viewModel.container.videoCoordinator.stopAndRestoreDisplay()
-                                    if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
-                                },
-                                onHandoffToMusicNowPlaying = {
-                                    if (viewModel.container.videoToAudioHandoff.handoffToBackgroundAudio()) {
-                                        if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
-                                        backStack.add(LumaRoute.NowPlaying("mini_player_art"))
-                                    }
-                                },
-                            )
-                        }
+                            onHandoffToMusicNowPlaying = {
+                                if (viewModel.container.videoToAudioHandoff.handoffToBackgroundAudio()) {
+                                    if (backStack.size > 1) backStack.removeLastOrNull()
+                                    backStack.add(LumaRoute.NowPlaying("mini_player_art"))
+                                }
+                            },
+                        )
                     }
                     entry<LumaRoute.NowPlaying> { route ->
-                        PredictiveBackContainer(
-                            enabled = backStack.size > 1,
-                            style = backStyle,
-                            onSharedVisibilityChange = { vis -> isPredictiveDragging = !vis },
-                            onBackCommitted = {
-                                if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
+                        NowPlayingScreen(
+                            heroKey = route.heroKey,
+                            viewModel = viewModel,
+                            sharedScope = sharedScope,
+                            sharedElementsVisible = effectiveStyle == PredictiveBackStyle.PREDICTIVE_DETACH_SHARED,
+                            onClose = {
+                                if (backStack.size > 1) backStack.removeLastOrNull()
                             },
-                        ) {
-                            NowPlayingScreen(
-                                heroKey = route.heroKey,
-                                viewModel = viewModel,
-                                sharedScope = sharedScope,
-                                sharedElementsVisible = !isPredictiveDragging,
-                                onClose = {
-                                    if (backStack.size > 1) backStack.removeAt(backStack.lastIndex)
-                                },
-                            )
-                        }
+                        )
                     }
                 },
             )
@@ -298,7 +302,7 @@ fun LumaNavigationRoot(
                         MiniPlayerBar(
                             state = musicState,
                             sharedScope = sharedScope,
-                            sharedElementsVisible = !isPredictiveDragging,
+                            sharedElementsVisible = effectiveStyle == PredictiveBackStyle.PREDICTIVE_DETACH_SHARED,
                             onTogglePlayPause = { viewModel.container.musicCoordinator.togglePlayPause() },
                             onNext = { viewModel.container.musicCoordinator.nextTrack() },
                             onPrev = { viewModel.container.musicCoordinator.prevTrack() },

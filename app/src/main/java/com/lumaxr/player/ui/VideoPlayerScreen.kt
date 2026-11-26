@@ -1,14 +1,19 @@
 package com.lumaxr.player.ui
 
 import android.app.Activity
+import android.content.Context
+import android.media.AudioManager
 import android.view.SurfaceView
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,6 +33,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
+import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.BookmarkAdd
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Headphones
@@ -35,6 +41,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -43,6 +50,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -50,15 +58,14 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -70,6 +77,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.lumaxr.player.video.AspectMode
 import com.lumaxr.player.video.DesktopInputHandler.lumaDesktopShortcuts
 import com.lumaxr.player.video.DesktopInputHandler.lumaMouseAndTrackpadCanvas
@@ -81,6 +89,17 @@ import com.lumaxr.player.video.VideoEngineKind
 import com.lumaxr.player.video.XrPreset
 import java.io.File
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.hypot
+import kotlin.math.roundToInt
+
+private enum class PlayerDragGestureMode {
+    NONE,
+    SEEK,
+    BRIGHTNESS,
+    VOLUME,
+    SPLIT_WIPE,
+}
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -95,23 +114,26 @@ fun VideoPlayerScreen(
 ) {
     val context = LocalContext.current
     val activity = context as? Activity
+    val audioManager = remember(context) { context.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
     val coordinator = viewModel.container.videoCoordinator
 
-    val xrPreset by viewModel.xrPreset.collectAsState()
-    val refreshPolicy by viewModel.refreshPolicy.collectAsState()
-    val enginePref by viewModel.enginePreference.collectAsState()
-    val hdrToysMapper by viewModel.hdrToysMapper.collectAsState()
-    val experimentalHbm by viewModel.experimentalHbm.collectAsState()
-    val subtitlePeakNits by viewModel.subtitlePeakNits.collectAsState()
-    val showTelemetryPill by viewModel.showTelemetryPill.collectAsState()
+    val xrPreset by viewModel.xrPreset.collectAsStateWithLifecycle()
+    val refreshPolicy by viewModel.refreshPolicy.collectAsStateWithLifecycle()
+    val enginePref by viewModel.enginePreference.collectAsStateWithLifecycle()
+    val hdrToysMapper by viewModel.hdrToysMapper.collectAsStateWithLifecycle()
+    val experimentalHbm by viewModel.experimentalHbm.collectAsStateWithLifecycle()
+    val subtitlePeakNits by viewModel.subtitlePeakNits.collectAsStateWithLifecycle()
+    val showTelemetryPill by viewModel.showTelemetryPill.collectAsStateWithLifecycle()
 
-    val hudTelemetry by coordinator.hudTelemetry.collectAsState()
-    val mpvTelemetry by coordinator.mpvEngine.telemetry.collectAsState()
-    val media3Telemetry by coordinator.media3Engine.telemetry.collectAsState()
-    val activeEngine by coordinator.activeEngineKind.collectAsState()
+    val hudTelemetry by coordinator.hudTelemetry.collectAsStateWithLifecycle()
+    val mpvTelemetry by coordinator.mpvEngine.telemetry.collectAsStateWithLifecycle()
+    val media3Telemetry by coordinator.media3Engine.telemetry.collectAsStateWithLifecycle()
+    val activeEngine by coordinator.activeEngineKind.collectAsStateWithLifecycle()
+    val mpvTracks by coordinator.mpvEngine.tracks.collectAsStateWithLifecycle()
 
     var showHud by remember { mutableStateOf(true) }
     var showMasteringSheet by remember { mutableStateOf(false) }
+    var showTracksSheet by remember { mutableStateOf(false) }
     var showContextMenu by remember { mutableStateOf(false) }
     var splitWipe by remember { mutableFloatStateOf(1.0f) }
     var aspectMode by remember { mutableStateOf(AspectMode.ORIGINAL) }
@@ -119,6 +141,17 @@ fun VideoPlayerScreen(
     var abLoopA by remember { mutableStateOf<Double?>(null) }
     var surfaceViewRef by remember { mutableStateOf<SurfaceView?>(null) }
     var playbackStarted by remember(uri, enginePref, experimentalHbm, refreshPolicy) { mutableStateOf(false) }
+    var gestureHudBadge by remember { mutableStateOf<String?>(null) }
+    var pendingSeekTargetSec by remember { mutableDoubleStateOf(0.0) }
+
+    val externalSubLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { subUri ->
+        if (subUri != null) {
+            coordinator.mpvEngine.addExternalSubtitle(subUri.toString())
+            Toast.makeText(context, "Loaded external subtitle", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     // True HyperOS 3 edge-to-edge immersive mode
     DisposableEffect(activity) {
@@ -131,7 +164,7 @@ fun VideoPlayerScreen(
         }
     }
 
-    // Guarantee engine + display cleanup even when exited via NavDisplay pop or PredictiveBackStyle.NONE
+    // Guarantee engine + display cleanup on exit
     DisposableEffect(uri) {
         onDispose {
             coordinator.stopAndRestoreDisplay()
@@ -216,7 +249,110 @@ fun VideoPlayerScreen(
                     onSecondaryContextMenu = { showContextMenu = true },
                 )
                 .pointerInput(Unit) {
-                    detectTapGestures(onTap = { showHud = !showHud })
+                    detectTapGestures(
+                        onTap = { showHud = !showHud },
+                        onDoubleTap = { offset ->
+                            when {
+                                offset.x < size.width * 0.35f -> {
+                                    coordinator.seekRelative(-10.0)
+                                    gestureHudBadge = "Seek -10s"
+                                }
+                                offset.x > size.width * 0.65f -> {
+                                    coordinator.seekRelative(10.0)
+                                    gestureHudBadge = "Seek +10s"
+                                }
+                                else -> coordinator.setPaused(!coordinator.isPaused())
+                            }
+                        },
+                    )
+                }
+                .pointerInput(splitWipe, durSecNow) {
+                    var dragMode = PlayerDragGestureMode.NONE
+                    var startX = 0f
+                    var accumX = 0f
+                    var accumY = 0f
+                    var startBrightness = 0.5f
+                    var startVolume = 8
+                    val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+                    var startPosSec = 0.0
+                    var seekActive = false
+
+                    detectDragGestures(
+                        onDragStart = { offset ->
+                            dragMode = PlayerDragGestureMode.NONE
+                            startX = offset.x
+                            accumX = 0f
+                            accumY = 0f
+                            seekActive = false
+                            startBrightness = activity?.window?.attributes?.screenBrightness?.takeIf { it >= 0f } ?: 0.55f
+                            startVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+                            startPosSec = coordinator.currentPositionSec()
+                        },
+                        onDragCancel = {
+                            dragMode = PlayerDragGestureMode.NONE
+                            gestureHudBadge = null
+                            seekActive = false
+                        },
+                        onDragEnd = {
+                            if (dragMode == PlayerDragGestureMode.SEEK && seekActive) {
+                                coordinator.seekToSec(pendingSeekTargetSec)
+                            }
+                            dragMode = PlayerDragGestureMode.NONE
+                            gestureHudBadge = null
+                            seekActive = false
+                        },
+                        onDrag = { change, dragAmount ->
+                            accumX += dragAmount.x
+                            accumY += dragAmount.y
+                            if (dragMode == PlayerDragGestureMode.NONE) {
+                                if (hypot(accumX, accumY) > viewConfiguration.touchSlop) {
+                                    dragMode = if (abs(accumX) >= abs(accumY)) {
+                                        if (splitWipe < 0.99f) PlayerDragGestureMode.SPLIT_WIPE else PlayerDragGestureMode.SEEK
+                                    } else {
+                                        if (startX < size.width * 0.5f) {
+                                            PlayerDragGestureMode.BRIGHTNESS
+                                        } else {
+                                            PlayerDragGestureMode.VOLUME
+                                        }
+                                    }
+                                }
+                            }
+                            if (dragMode != PlayerDragGestureMode.NONE) {
+                                change.consume()
+                                when (dragMode) {
+                                    PlayerDragGestureMode.SPLIT_WIPE -> {
+                                        splitWipe = (splitWipe + dragAmount.x / size.width.toFloat().coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                        coordinator.setSplitWipe(splitWipe)
+                                        gestureHudBadge = "XR Wipe ${(splitWipe * 100).roundToInt()}%"
+                                    }
+                                    PlayerDragGestureMode.SEEK -> {
+                                        val deltaSec = (accumX / size.width.toFloat().coerceAtLeast(1f)) * 90.0
+                                        pendingSeekTargetSec = (startPosSec + deltaSec).coerceIn(0.0, durSecNow)
+                                        seekActive = true
+                                        val sign = if (deltaSec >= 0) "+" else "-"
+                                        gestureHudBadge = "${formatTimeSec(pendingSeekTargetSec)} ($sign${abs(deltaSec).toInt()}s)"
+                                    }
+                                    PlayerDragGestureMode.BRIGHTNESS -> {
+                                        val deltaFrac = -accumY / (size.height * 0.65f).coerceAtLeast(1f)
+                                        val nextB = (startBrightness + deltaFrac).coerceIn(0.02f, 1.0f)
+                                        activity?.window?.let { win ->
+                                            val lp = win.attributes
+                                            lp.screenBrightness = nextB
+                                            win.attributes = lp
+                                        }
+                                        gestureHudBadge = "Brightness ${(nextB * 100).roundToInt()}%"
+                                    }
+                                    PlayerDragGestureMode.VOLUME -> {
+                                        val deltaFrac = -accumY / (size.height * 0.65f).coerceAtLeast(1f)
+                                        val nextVol = (startVolume + deltaFrac * maxVolume).roundToInt().coerceIn(0, maxVolume)
+                                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, nextVol, 0)
+                                        gestureHudBadge = "Volume ${((nextVol * 100f) / maxVolume).roundToInt()}%"
+                                    }
+                                    PlayerDragGestureMode.NONE -> Unit
+                                }
+                            }
+                        },
+                    )
                 },
         ) {
             AndroidView(
@@ -228,18 +364,21 @@ fun VideoPlayerScreen(
                 modifier = Modifier.fillMaxSize(),
             )
 
-            // Live A/B Split Wipe Draggable Handle when splitWipe < 0.99f
-            if (splitWipe < 0.99f) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .pointerInput(Unit) {
-                            detectHorizontalDragGestures { _, dx ->
-                                splitWipe = (splitWipe + dx / size.width.toFloat()).coerceIn(0f, 1f)
-                                coordinator.setSplitWipe(splitWipe)
-                            }
-                        },
-                )
+            // Transient Gesture / Seek Feedback Pill
+            gestureHudBadge?.let { badge ->
+                Surface(
+                    color = Color(0xCC0F172A),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier.align(Alignment.Center),
+                ) {
+                    Text(
+                        text = badge,
+                        color = Color(0xFF38BDF8),
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+                    )
+                }
             }
 
             // M3 Telemetry Pill HUD (Toggleable)
@@ -321,6 +460,11 @@ fun VideoPlayerScreen(
                             )
                         }
 
+                        if (activeEngine == VideoEngineKind.LIBMPV_PLACEBO_XR) {
+                            IconButton(onClick = { showTracksSheet = true }) {
+                                Icon(Icons.Default.Subtitles, contentDescription = "Tracks & Subtitles", tint = Color.White)
+                            }
+                        }
                         IconButton(onClick = onHandoffToMusicNowPlaying) {
                             Icon(Icons.Default.Headphones, contentDescription = "Background Audio", tint = Color.White)
                         }
@@ -420,6 +564,10 @@ fun VideoPlayerScreen(
                     onClick = { viewModel.toggleTelemetryPill(); showContextMenu = false },
                 )
                 DropdownMenuItem(
+                    text = { Text("Audio, Subtitles & Speed") },
+                    onClick = { showTracksSheet = true; showContextMenu = false },
+                )
+                DropdownMenuItem(
                     text = { Text("XR Mastering Sheet") },
                     onClick = { showMasteringSheet = true; showContextMenu = false },
                 )
@@ -439,6 +587,93 @@ fun VideoPlayerScreen(
                     text = { Text("Clear A-B Loop") },
                     onClick = { coordinator.mpvEngine.setAbLoop(null, null); abLoopA = null; showContextMenu = false },
                 )
+            }
+        }
+    }
+
+    if (showTracksSheet) {
+        val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        val audioTracks = mpvTracks.filter { it.type == "audio" }
+        val subTracks = mpvTracks.filter { it.type == "sub" }
+        val speeds = listOf(0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+
+        ModalBottomSheet(
+            onDismissRequest = { showTracksSheet = false },
+            sheetState = sheetState,
+            containerColor = Color(0xFF0F172A),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .navigationBarsPadding()
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text("Tracks, Subtitles & Speed", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+
+                Text("Playback Speed", color = Color(0xFFCBD5E1), fontSize = 13.sp)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    speeds.forEach { spd ->
+                        FilterChip(
+                            selected = abs(mpvTelemetry.speed - spd) < 0.05,
+                            onClick = { coordinator.mpvEngine.setSpeed(spd) },
+                            label = { Text("${spd}x", fontSize = 11.sp) },
+                        )
+                    }
+                }
+
+                Text("Audio Tracks", color = Color(0xFFCBD5E1), fontSize = 13.sp)
+                if (audioTracks.isEmpty()) {
+                    Text("No selectable audio tracks reported yet", color = Color(0xFF64748B), fontSize = 12.sp)
+                } else {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        audioTracks.forEach { tr ->
+                            val label = listOfNotNull(
+                                tr.lang.takeIf { it.isNotBlank() },
+                                tr.title.takeIf { it.isNotBlank() },
+                                tr.codec.takeIf { it.isNotBlank() },
+                            ).joinToString(" • ").ifBlank { "Track ${tr.id}" }
+                            FilterChip(
+                                selected = tr.selected,
+                                onClick = { coordinator.mpvEngine.selectTrack("aid", tr.id) },
+                                leadingIcon = { Icon(Icons.Default.Audiotrack, contentDescription = null) },
+                                label = { Text(label, fontSize = 11.sp) },
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Subtitle Tracks", color = Color(0xFFCBD5E1), fontSize = 13.sp)
+                    OutlinedButton(onClick = { externalSubLauncher.launch(arrayOf("*/*")) }) {
+                        Text("Load External Sub")
+                    }
+                }
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = subTracks.none { it.selected },
+                        onClick = { coordinator.mpvEngine.selectTrack("sid", 0) },
+                        label = { Text("Subtitles Off", fontSize = 11.sp) },
+                    )
+                    subTracks.forEach { tr ->
+                        val label = listOfNotNull(
+                            tr.lang.takeIf { it.isNotBlank() },
+                            tr.title.takeIf { it.isNotBlank() },
+                            tr.codec.takeIf { it.isNotBlank() },
+                        ).joinToString(" • ").ifBlank { "Sub ${tr.id}" }
+                        FilterChip(
+                            selected = tr.selected,
+                            onClick = { coordinator.mpvEngine.selectTrack("sid", tr.id) },
+                            label = { Text(label, fontSize = 11.sp) },
+                        )
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
             }
         }
     }

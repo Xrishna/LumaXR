@@ -1,5 +1,10 @@
 package com.lumaxr.player.music
 
+import android.content.ComponentName
+import android.content.Context
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionToken
+import com.google.common.util.concurrent.ListenableFuture
 import com.lumaxr.player.data.AudioTrackEntity
 import com.lumaxr.player.data.ListeningEventEntity
 import com.lumaxr.player.data.ListeningStatsDao
@@ -52,6 +57,7 @@ data class MusicPlaybackState(
 )
 
 class MusicPlaybackCoordinator(
+    private val context: Context,
     private val scope: CoroutineScope,
     val media3Engine: Media3MusicEngine,
     val mpvAudioEngine: MpvAudioEngine,
@@ -68,15 +74,34 @@ class MusicPlaybackCoordinator(
         private val MPV_EXCLUSIVE_EXTENSIONS = setOf("dsf", "dff", "thd", "mlp", "dts", "dtshd", "wv", "ape", "mpc", "mka")
     }
 
+    private val appContext = context.applicationContext
     private val _state = MutableStateFlow(MusicPlaybackState())
     val state: StateFlow<MusicPlaybackState> = _state.asStateFlow()
 
     private var tickerJob: Job? = null
     private var sleepJob: Job? = null
     private var crossfadeJob: Job? = null
+    private var mediaControllerFuture: ListenableFuture<MediaController>? = null
+    private var lastWidgetKey: Pair<String?, Boolean>? = null
 
     @Volatile
     private var scrobbleDispatchedForCurrent = false
+
+    private fun ensureServiceSessionBound() {
+        if (mediaControllerFuture != null) return
+        runCatching {
+            val token = SessionToken(appContext, ComponentName(appContext, LumaMusicLibraryService::class.java))
+            mediaControllerFuture = MediaController.Builder(appContext, token).buildAsync()
+        }
+    }
+
+    private fun notifyWidgetIfChanged(trackUri: String?, isPlaying: Boolean) {
+        val next = trackUri to isPlaying
+        if (lastWidgetKey != next) {
+            lastWidgetKey = next
+            scope.launch { MusicGlanceWidget.notifyStateChanged(appContext) }
+        }
+    }
 
     init {
         mpvAudioEngine.onTrackEnded = {
@@ -132,6 +157,7 @@ class MusicPlaybackCoordinator(
     ) {
         if (tracks.isEmpty()) return
         crossfadeJob?.cancel()
+        ensureServiceSessionBound()
         val safeIdx = startIndex.coerceIn(0, tracks.lastIndex)
         val track = tracks[safeIdx]
         scrobbleDispatchedForCurrent = false
@@ -179,6 +205,7 @@ class MusicPlaybackCoordinator(
             musicDao.recordPlay(track.uri)
             refreshSignalPath()
         }
+        notifyWidgetIfChanged(track.uri, true)
     }
 
     fun togglePlayPause() {
@@ -190,6 +217,7 @@ class MusicPlaybackCoordinator(
             if (nextPlaying) media3Engine.player.play() else media3Engine.player.pause()
         }
         _state.update { it.copy(isPlaying = nextPlaying) }
+        notifyWidgetIfChanged(cur.currentTrack?.uri, nextPlaying)
     }
 
     fun seekToMs(ms: Long) {
@@ -409,6 +437,8 @@ class MusicPlaybackCoordinator(
         tickerJob?.cancel()
         sleepJob?.cancel()
         crossfadeJob?.cancel()
+        mediaControllerFuture?.let { MediaController.releaseFuture(it) }
+        mediaControllerFuture = null
         mpvAudioEngine.onTrackEnded = null
         media3Engine.onQueueIndexChanged = null
         media3Engine.release()

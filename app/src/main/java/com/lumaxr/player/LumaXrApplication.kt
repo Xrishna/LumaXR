@@ -82,9 +82,11 @@ class AppContainer(context: Context) {
         loudnessManager = loudnessManager,
         usbBitPerfectManager = usbBitPerfectManager,
         spatialAudioManager = spatialAudioManager,
+        fftAnalyzer = audioFftAnalyzer,
     )
     val mpvAudioEngine = MpvAudioEngine(context, dspController)
     val musicCoordinator = MusicPlaybackCoordinator(
+        context = context,
         scope = appScope,
         media3Engine = media3MusicEngine,
         mpvAudioEngine = mpvAudioEngine,

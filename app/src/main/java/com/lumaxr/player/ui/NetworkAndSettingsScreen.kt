@@ -28,12 +28,12 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -57,12 +57,13 @@ fun NetworkAndSettingsScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val backStyle by viewModel.backStyle.collectAsState()
-    val refreshPolicy by viewModel.refreshPolicy.collectAsState()
-    val experimentalHbm by viewModel.experimentalHbm.collectAsState()
-    val servers by viewModel.networkServers.collectAsState()
-    val remoteEntriesByServer by viewModel.remoteEntriesByServer.collectAsState()
-    val backupStatus by viewModel.backupStatus.collectAsState()
+    val backStyle by viewModel.backStyle.collectAsStateWithLifecycle()
+    val refreshPolicy by viewModel.refreshPolicy.collectAsStateWithLifecycle()
+    val experimentalHbm by viewModel.experimentalHbm.collectAsStateWithLifecycle()
+    val servers by viewModel.networkServers.collectAsStateWithLifecycle()
+    val remoteEntriesByServer by viewModel.remoteEntriesByServer.collectAsStateWithLifecycle()
+    val backupStatus by viewModel.backupStatus.collectAsStateWithLifecycle()
+    var vulkanEnabled by rememberSaveable { mutableStateOf(viewModel.container.videoCoordinator.isUsingVulkan()) }
 
     LaunchedEffect(backupStatus) {
         val msg = backupStatus
@@ -142,6 +143,30 @@ fun NetworkAndSettingsScreen(
                         )
                     }
                     Switch(checked = experimentalHbm, onCheckedChange = { viewModel.setExperimentalHbm(it) })
+                }
+
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (vulkanEnabled) "GPU Backend: Vulkan 1.1 Primary (libplacebo)" else "GPU Backend: OpenGL ES 3.2 Fallback Active",
+                            color = Color.White,
+                            fontSize = 14.sp,
+                        )
+                        Text(
+                            text = if (vulkanEnabled) "Adreno 710 auto-falls back to GLES 3.2 if Vulkan init fails." else "Tap Reset to retry Vulkan 1.1 gpu-next initialization.",
+                            color = Color(0xFF94A3B8),
+                            fontSize = 11.sp,
+                        )
+                    }
+                    if (!vulkanEnabled) {
+                        OutlinedButton(onClick = {
+                            viewModel.container.videoCoordinator.resetVulkanFallbackPreference()
+                            vulkanEnabled = true
+                            Toast.makeText(context, "Vulkan 1.1 re-enabled", Toast.LENGTH_SHORT).show()
+                        }) {
+                            Text("Reset Vulkan")
+                        }
+                    }
                 }
             }
         }

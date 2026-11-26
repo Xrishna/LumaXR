@@ -43,12 +43,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -96,13 +96,13 @@ fun NowPlayingScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val coordinator = viewModel.container.musicCoordinator
-    val state by coordinator.state.collectAsState()
-    val lyricsState by viewModel.lyricsState.collectAsState()
-    val lyricStyle by viewModel.lyricStyle.collectAsState()
-    val glowConfig by viewModel.glowConfig.collectAsState()
-    val peaks by viewModel.waveformPeaks.collectAsState()
-    val fftFrame by viewModel.container.audioFftAnalyzer.frame.collectAsState()
-    val thermal by viewModel.container.thermalGovernor.snapshot.collectAsState()
+    val state by coordinator.state.collectAsStateWithLifecycle()
+    val lyricsState by viewModel.lyricsState.collectAsStateWithLifecycle()
+    val lyricStyle by viewModel.lyricStyle.collectAsStateWithLifecycle()
+    val glowConfig by viewModel.glowConfig.collectAsStateWithLifecycle()
+    val peaks by viewModel.waveformPeaks.collectAsStateWithLifecycle()
+    val fftFrame by viewModel.container.audioFftAnalyzer.frame.collectAsStateWithLifecycle()
+    val thermal by viewModel.container.thermalGovernor.snapshot.collectAsStateWithLifecycle()
 
     var rightTab by remember { mutableIntStateOf(0) }
     var showSignalPath by remember { mutableStateOf(false) }
@@ -122,8 +122,14 @@ fun NowPlayingScreen(
     val track = state.currentTrack
     val oscPath = remember { Path() }
 
-    LaunchedEffect(track?.artworkUri) {
-        val artUri = track?.artworkUri?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+    LaunchedEffect(track?.uri, track?.artworkUri) {
+        val artUri = track?.artworkUri?.takeIf { it.isNotBlank() }
+        if (artUri == null) {
+            renderer.submitArtworkOrVideoFrame(
+                VisualStudioRenderer.createAmbientPaletteBitmap(track?.title ?: "LumaXR-Aurora"),
+            )
+            return@LaunchedEffect
+        }
         val req = ImageRequest.Builder(context)
             .data(artUri)
             .allowHardware(false)
@@ -135,6 +141,10 @@ fun NowPlayingScreen(
         val bmp = (res as? SuccessResult)?.drawable?.toBitmap(config = android.graphics.Bitmap.Config.ARGB_8888)
         if (bmp != null) {
             renderer.submitArtworkOrVideoFrame(bmp)
+        } else {
+            renderer.submitArtworkOrVideoFrame(
+                VisualStudioRenderer.createAmbientPaletteBitmap(track?.title ?: "LumaXR-Aurora"),
+            )
         }
     }
 
@@ -376,7 +386,7 @@ fun NowPlayingScreen(
                             modifier = Modifier.fillMaxSize().padding(16.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            itemsIndexed(state.queue) { idx, q ->
+                            itemsIndexed(state.queue, key = { idx, q -> "${idx}_${q.uri}" }) { idx, q ->
                                 Surface(
                                     color = if (idx == state.currentIndex) Color(0xFF1E3A5F) else Color(0xFF111827),
                                     shape = RoundedCornerShape(12.dp),

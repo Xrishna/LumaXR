@@ -1,5 +1,7 @@
 package com.lumaxr.player.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.SharedTransitionScope
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -21,6 +23,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Refresh
@@ -33,7 +36,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,6 +51,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 @Composable
 fun VideoLibraryScreen(
@@ -58,8 +61,15 @@ fun VideoLibraryScreen(
     sharedElementsVisible: Boolean,
     onOpenVideo: (VideoLibraryItem) -> Unit,
 ) {
-    val videos by viewModel.videos.collectAsState()
+    val videos by viewModel.videos.collectAsStateWithLifecycle()
     var streamUrlInput by rememberSaveable { mutableStateOf("") }
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            onOpenVideo(viewModel.buildVideoItemFromDocumentUri(uri))
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -70,7 +80,7 @@ fun VideoLibraryScreen(
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             OutlinedTextField(
                 value = streamUrlInput,
@@ -100,6 +110,14 @@ fun VideoLibraryScreen(
             ) {
                 Text("Play URL")
             }
+            OutlinedButton(
+                onClick = {
+                    filePickerLauncher.launch(arrayOf("video/*", "application/x-matroska", "*/*"))
+                },
+            ) {
+                Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.padding(end = 4.dp))
+                Text("Open File")
+            }
             IconButton(onClick = { viewModel.refreshMediaLibraries() }) {
                 Icon(Icons.Default.Refresh, contentDescription = "Rescan", tint = Color(0xFF38BDF8))
             }
@@ -114,9 +132,14 @@ fun VideoLibraryScreen(
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     Icon(Icons.Default.Movie, contentDescription = null, tint = Color(0xFF475569), modifier = Modifier.padding(8.dp))
-                    Text("No local videos found yet. Grant storage permission or paste a stream URL above.", color = Color(0xFF94A3B8))
-                    OutlinedButton(onClick = { viewModel.refreshMediaLibraries() }) {
-                        Text("Rescan Libraries")
+                    Text("No local videos found yet. Pick a file, grant storage permission, or paste a stream URL above.", color = Color(0xFF94A3B8))
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Button(onClick = { filePickerLauncher.launch(arrayOf("video/*", "application/x-matroska", "*/*")) }) {
+                            Text("Pick Local Video")
+                        }
+                        OutlinedButton(onClick = { viewModel.refreshMediaLibraries() }) {
+                            Text("Rescan Libraries")
+                        }
                     }
                 }
             }

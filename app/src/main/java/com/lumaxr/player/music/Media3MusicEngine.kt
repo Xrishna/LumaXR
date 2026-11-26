@@ -11,12 +11,18 @@ import androidx.media3.common.TrackSelectionParameters.AudioOffloadPreferences
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.TeeAudioProcessor
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import com.lumaxr.player.data.AudioTrackEntity
 import com.lumaxr.player.hardware.RuanHardwareProfile
+import com.lumaxr.player.visuals.AudioFftAnalyzer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 data class Media3AudioState(
     val audioSessionId: Int = 0,
@@ -37,6 +43,7 @@ class Media3MusicEngine(
     private val loudnessManager: LoudnessAndReplayGainManager,
     private val usbBitPerfectManager: UsbBitPerfectManager,
     private val spatialAudioManager: SpatialAudioManager,
+    private val fftAnalyzer: AudioFftAnalyzer? = null,
 ) {
     private val appContext = context.applicationContext
     private val _state = MutableStateFlow(Media3AudioState())
@@ -47,8 +54,89 @@ class Media3MusicEngine(
     private var lastTracks: List<AudioTrackEntity> = emptyList()
     private var lastPreferBitPerfect = false
 
+    private val pcmBufferSink = object : TeeAudioProcessor.AudioBufferSink {
+        private var sampleRateHz = 48000
+        private var channelCount = 2
+        private var encoding = C.ENCODING_PCM_16BIT
+        private val ring = FloatArray(256)
+        private var ringIdx = 0
+        private var lastDispatchMs = 0L
+
+        override fun flush(sampleRateHz: Int, channelCount: Int, encoding: Int) {
+            this.sampleRateHz = sampleRateHz.coerceAtLeast(8000)
+            this.channelCount = channelCount.coerceAtLeast(1)
+            this.encoding = encoding
+            ringIdx = 0
+        }
+
+        override fun handleBuffer(buffer: ByteBuffer) {
+            val analyzer = fftAnalyzer ?: return
+            val dup = buffer.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
+            if (dup.remaining() < 4) return
+
+            val ch = channelCount.coerceAtLeast(1)
+            when (encoding) {
+                C.ENCODING_PCM_16BIT -> {
+                    val frameBytes = ch * 2
+                    while (dup.remaining() >= frameBytes) {
+                        var sum = 0f
+                        for (c in 0 until ch) {
+                            sum += dup.short / 32768f
+                        }
+                        pushSample(sum / ch, analyzer)
+                    }
+                }
+                C.ENCODING_PCM_FLOAT -> {
+                    val frameBytes = ch * 4
+                    while (dup.remaining() >= frameBytes) {
+                        var sum = 0f
+                        for (c in 0 until ch) {
+                            sum += dup.float
+                        }
+                        pushSample(sum / ch, analyzer)
+                    }
+                }
+                C.ENCODING_PCM_32BIT -> {
+                    val frameBytes = ch * 4
+                    while (dup.remaining() >= frameBytes) {
+                        var sum = 0f
+                        for (c in 0 until ch) {
+                            sum += dup.int / 2147483648f
+                        }
+                        pushSample(sum / ch, analyzer)
+                    }
+                }
+            }
+        }
+
+        private fun pushSample(mono: Float, analyzer: AudioFftAnalyzer) {
+            ring[ringIdx++] = mono
+            if (ringIdx >= ring.size) {
+                ringIdx = 0
+                val now = android.os.SystemClock.uptimeMillis()
+                if (now - lastDispatchMs >= 16L) {
+                    lastDispatchMs = now
+                    analyzer.submitPcmSamples(ring.copyOf(), sampleRateHz)
+                }
+            }
+        }
+    }
+
     init {
-        val renderersFactory = DefaultRenderersFactory(appContext)
+        val teeProcessor = TeeAudioProcessor(pcmBufferSink)
+        val renderersFactory = object : DefaultRenderersFactory(appContext) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean,
+            ): AudioSink {
+                return DefaultAudioSink.Builder(context)
+                    .setEnableFloatOutput(enableFloatOutput)
+                    .setEnableAudioTrackPlaybackParameters(enableAudioTrackPlaybackParams)
+                    .setAudioProcessors(arrayOf(teeProcessor))
+                    .build()
+            }
+        }
             .setEnableDecoderFallback(true)
             .setEnableAudioOutputPlaybackParameters(true)
             .setMediaCodecSelector(codecSelector)
@@ -162,7 +250,8 @@ class Media3MusicEngine(
         dspController.setBitPerfectBypass(bpActive)
 
         val dspActive = dspController.state.value.enabled && !bpActive
-        val offloadMode = if (screenOffOffloadAllowed && !dspActive) {
+        // Disable offload while DSP or live FFT visualizer PCM tap is attached so TeeAudioProcessor stays active.
+        val offloadMode = if (screenOffOffloadAllowed && !dspActive && fftAnalyzer == null) {
             AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_ENABLED
         } else {
             AudioOffloadPreferences.AUDIO_OFFLOAD_MODE_DISABLED

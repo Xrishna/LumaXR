@@ -2,10 +2,15 @@ package com.lumaxr.player.visuals
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.Shader
 import android.opengl.GLES32
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.os.SystemClock
+import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -15,6 +20,7 @@ import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.egl.EGLDisplay
 import javax.microedition.khronos.egl.EGLSurface
 import javax.microedition.khronos.opengles.GL10
+import kotlin.math.abs
 
 class VisualStudioRenderer(
     private val context: Context,
@@ -35,6 +41,36 @@ class VisualStudioRenderer(
                 gl_Position = vec4(a_pos, 0.0, 1.0);
             }
         """
+
+        fun createAmbientPaletteBitmap(seedTitle: String): Bitmap {
+            val h = abs(seedTitle.hashCode())
+            val palette = intArrayOf(
+                0xFF0F2B46.toInt(),
+                0xFF1E3A8A.toInt(),
+                0xFF4C1D95.toInt(),
+                0xFF0E7490.toInt(),
+                0xFF831843.toInt(),
+                0xFF0F766E.toInt(),
+            )
+            val c1 = palette[h % palette.size]
+            val c2 = palette[(h / 7 + 1) % palette.size]
+            val c3 = palette[(h / 13 + 2) % palette.size]
+            val bmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                shader = LinearGradient(
+                    0f,
+                    0f,
+                    64f,
+                    64f,
+                    intArrayOf(c1, c2, c3),
+                    floatArrayOf(0f, 0.52f, 1f),
+                    Shader.TileMode.CLAMP,
+                )
+            }
+            canvas.drawRect(0f, 0f, 64f, 64f, paint)
+            return bmp
+        }
 
         fun createSrgbWindowFactory(): GLSurfaceView.EGLWindowSurfaceFactory {
             return object : GLSurfaceView.EGLWindowSurfaceFactory {
@@ -115,7 +151,9 @@ class VisualStudioRenderer(
         GLES32.glTexParameteri(GLES32.GL_TEXTURE_2D, GLES32.GL_TEXTURE_MAG_FILTER, GLES32.GL_LINEAR)
         GLES32.glTexParameteri(GLES32.GL_TEXTURE_2D, GLES32.GL_TEXTURE_WRAP_S, GLES32.GL_CLAMP_TO_EDGE)
         GLES32.glTexParameteri(GLES32.GL_TEXTURE_2D, GLES32.GL_TEXTURE_WRAP_T, GLES32.GL_CLAMP_TO_EDGE)
-        val fallback = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888).apply { eraseColor(0xFF102038.toInt()) }
+        val fallback = createAmbientPaletteBitmap("LumaXR-Aurora")
+        sourceTexW = fallback.width
+        sourceTexH = fallback.height
         GLUtils.texImage2D(GLES32.GL_TEXTURE_2D, 0, fallback, 0)
         fallback.recycle()
     }
@@ -123,7 +161,7 @@ class VisualStudioRenderer(
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         this.width = width.coerceAtLeast(1)
         this.height = height.coerceAtLeast(1)
-        allocateFloat16PingPong(256, 256)
+        allocateFloat16PingPong(128, 128)
     }
 
     private fun allocateFloat16PingPong(w: Int, h: Int) {
@@ -193,7 +231,7 @@ class VisualStudioRenderer(
         if (cfg.visualizerMode == VisualizerMode.MILKDROP_PLASMA) {
             val writeIdx = 1 - pingIdx
             GLES32.glBindFramebuffer(GLES32.GL_FRAMEBUFFER, fboIds[writeIdx])
-            GLES32.glViewport(0, 0, 256, 256)
+            GLES32.glViewport(0, 0, 128, 128)
             GLES32.glUseProgram(progMilk)
             GLES32.glActiveTexture(GLES32.GL_TEXTURE0)
             GLES32.glBindTexture(GLES32.GL_TEXTURE_2D, texIds[pingIdx])
@@ -220,7 +258,7 @@ class VisualStudioRenderer(
                 val writeIdx = pingIdx
                 val prog = if (p < passes / 2) progDown else progUp
                 GLES32.glBindFramebuffer(GLES32.GL_FRAMEBUFFER, fboIds[writeIdx])
-                GLES32.glViewport(0, 0, 256, 256)
+                GLES32.glViewport(0, 0, 128, 128)
                 GLES32.glUseProgram(prog)
                 GLES32.glActiveTexture(GLES32.GL_TEXTURE0)
                 GLES32.glBindTexture(GLES32.GL_TEXTURE_2D, inputTex)
@@ -230,8 +268,8 @@ class VisualStudioRenderer(
                 drawQuad()
                 lastWriteTex = texIds[writeIdx]
                 inputTex = lastWriteTex
-                curW = 256
-                curH = 256
+                curW = 128
+                curH = 128
                 pingIdx = 1 - pingIdx
             }
             compositeTexId = lastWriteTex
@@ -283,6 +321,11 @@ class VisualStudioRenderer(
         GLES32.glAttachShader(prog, vs)
         GLES32.glAttachShader(prog, fs)
         GLES32.glLinkProgram(prog)
+        val linked = IntArray(1)
+        GLES32.glGetProgramiv(prog, GLES32.GL_LINK_STATUS, linked, 0)
+        if (linked[0] == 0) {
+            Log.e("VisualStudioRenderer", "Program link failed: ${GLES32.glGetProgramInfoLog(prog)}")
+        }
         GLES32.glDeleteShader(vs)
         GLES32.glDeleteShader(fs)
         return prog
@@ -292,6 +335,11 @@ class VisualStudioRenderer(
         val shader = GLES32.glCreateShader(type)
         GLES32.glShaderSource(shader, src)
         GLES32.glCompileShader(shader)
+        val compiled = IntArray(1)
+        GLES32.glGetShaderiv(shader, GLES32.GL_COMPILE_STATUS, compiled, 0)
+        if (compiled[0] == 0) {
+            Log.e("VisualStudioRenderer", "Shader compile failed: ${GLES32.glGetShaderInfoLog(shader)}")
+        }
         return shader
     }
 }

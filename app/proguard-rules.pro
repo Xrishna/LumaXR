@@ -2,9 +2,12 @@
 -keepattributes Signature,InnerClasses,EnclosingMethod,*Annotation*,SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
 
-# Kotlinx Serialization (classes, objects, enums)
+# Kotlinx Serialization & Navigation 3 NavKey routes
 -keepclassmembers class kotlinx.serialization.json.** { *; }
+-keep class kotlinx.serialization.modules.** { *; }
 -keep,includedescriptorclasses class com.lumaxr.player.**$$serializer { *; }
+-keep class com.lumaxr.player.ui.LumaRoute** { *; }
+-keepnames interface androidx.navigation3.runtime.NavKey
 -keepclassmembers class com.lumaxr.player.** {
     *** Companion;
 }

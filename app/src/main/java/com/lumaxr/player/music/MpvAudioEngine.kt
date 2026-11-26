@@ -1,6 +1,7 @@
 package com.lumaxr.player.music
 
 import android.content.Context
+import com.lumaxr.player.video.MpvUriResolver
 import `is`.xyz.mpv.MPV
 import `is`.xyz.mpv.MPVNode
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -42,20 +43,23 @@ class MpvAudioEngine(
     var onTrackEnded: (() -> Unit)? = null
 
     private fun ensureInitializedLocked(): MPV? {
-        mpv?.let { return it }
-        val instance = MPV(appContext, configDir.absolutePath, cacheDir.absolutePath)
+        mpv?.let { if (it.isInitialized) return it }
+        // MPV(context, configDir, cacheDir) init{} already runs nativeCreate/nativeInit/initSession.
+        val instance = try {
+            MPV(appContext, configDir.absolutePath, cacheDir.absolutePath)
+        } catch (_: Throwable) {
+            return null
+        }
         return try {
-            instance.nativeCreate(appContext)
             instance.setOptionString("vid", "no")
             instance.setOptionString("vo", "null")
+            instance.setOptionString("ao", "audiotrack,opensles")
             instance.setOptionString("gapless-audio", "yes")
             instance.setOptionString("audio-resample-filter-size", "32")
             instance.setOptionString("audio-format", "floatp")
             instance.setOptionString("replaygain", "track")
             instance.setOptionString("replaygain-clip", "yes")
             instance.setOptionString("keep-open", "no")
-            instance.nativeInit()
-            instance.initSession()
             instance.addObserver(this)
             instance.observeProperty("time-pos", MPV.mpvFormat.MPV_FORMAT_DOUBLE)
             instance.observeProperty("duration", MPV.mpvFormat.MPV_FORMAT_DOUBLE)
@@ -63,7 +67,10 @@ class MpvAudioEngine(
             mpv = instance
             instance
         } catch (_: Throwable) {
-            runCatching { instance.nativeDestroy(); instance.close() }
+            runCatching {
+                instance.removeObserver(this)
+                instance.close()
+            }
             null
         }
     }
@@ -75,6 +82,8 @@ class MpvAudioEngine(
         useSofaHrtf: Boolean = false,
         replayGainMode: ReplayGainMode = ReplayGainMode.TRACK,
     ) {
+        val resolvedUri = MpvUriResolver.resolveForMpv(appContext, uri)
+        if (resolvedUri.isBlank()) return
         synchronized(lock) {
             val m = ensureInitializedLocked() ?: return
             suppressNextEndFile = _state.value.isPlaying
@@ -89,8 +98,9 @@ class MpvAudioEngine(
             applyCombinedAfLocked(m, useSofaHrtf)
             m.setPropertyString("start", if (startMs > 0L) String.format(Locale.US, "%.3f", startMs / 1000.0) else "none")
             m.setPropertyString("end", if (endMs > 0L) String.format(Locale.US, "%.3f", endMs / 1000.0) else "none")
+            m.setPropertyBoolean("pause", false)
             _state.value = _state.value.copy(isPlaying = true, positionMs = 0L, durationMs = 0L)
-            m.command("loadfile", uri)
+            m.command("loadfile", resolvedUri)
         }
     }
 
@@ -189,8 +199,7 @@ class MpvAudioEngine(
             mpv?.let {
                 runCatching {
                     it.removeObserver(this)
-                    it.destroySession()
-                    it.nativeDestroy()
+                    // MPV.close() destroys the native handle and session cleanly.
                     it.close()
                 }
             }

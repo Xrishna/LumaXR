@@ -18,9 +18,9 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -36,11 +36,11 @@ import java.util.Locale
 @Composable
 fun EqualizerScreen(viewModel: MainViewModel) {
     val dsp = viewModel.container.dspController
-    val dspState by dsp.state.collectAsState()
-    val usbState by viewModel.container.usbBitPerfectManager.state.collectAsState()
-    val spatState by viewModel.container.spatialAudioManager.state.collectAsState()
-    val route by viewModel.container.deviceProfileRouter.activeRoute.collectAsState()
-    val musicState by viewModel.container.musicCoordinator.state.collectAsState()
+    val dspState by dsp.state.collectAsStateWithLifecycle()
+    val usbState by viewModel.container.usbBitPerfectManager.state.collectAsStateWithLifecycle()
+    val spatState by viewModel.container.spatialAudioManager.state.collectAsStateWithLifecycle()
+    val route by viewModel.container.deviceProfileRouter.activeRoute.collectAsStateWithLifecycle()
+    val musicState by viewModel.container.musicCoordinator.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
     val dspEnabled = !usbState.activeBitPerfect
 

@@ -3,10 +3,13 @@ package com.lumaxr.player.ui
 import android.app.Application
 import android.content.ContentUris
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import java.util.Locale
 import com.lumaxr.player.LumaXrApplication
 import com.lumaxr.player.data.AudioTrackEntity
 import com.lumaxr.player.data.FolderVideoConfigEntity
@@ -216,6 +219,68 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         _videos.value = list
+    }
+
+    fun buildVideoItemFromDocumentUri(uri: Uri): VideoLibraryItem {
+        val ctx = getApplication<Application>()
+        runCatching {
+            ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val displayName = resolveDocumentDisplayName(ctx, uri)
+            ?: uri.lastPathSegment?.substringAfterLast('/')
+            ?: "Local Video"
+        return VideoLibraryItem(
+            uri = uri.toString(),
+            title = displayName,
+            folderPath = "Picked File",
+            durationMs = 0L,
+            width = 0,
+            height = 0,
+            sizeBytes = 0L,
+        )
+    }
+
+    fun buildAudioTrackFromDocumentUri(uri: Uri): AudioTrackEntity {
+        val ctx = getApplication<Application>()
+        runCatching {
+            ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        val displayName = resolveDocumentDisplayName(ctx, uri)
+            ?: uri.lastPathSegment?.substringAfterLast('/')
+            ?: "Local Audio"
+        val ext = displayName.substringAfterLast('.', "").lowercase(Locale.ROOT)
+        return AudioTrackEntity(
+            uri = uri.toString(),
+            title = displayName.substringBeforeLast('.').ifBlank { displayName },
+            artist = "Local File",
+            album = "Picked Audio",
+            albumArtist = "Local File",
+            composer = "",
+            year = 0,
+            trackNumber = 1,
+            discNumber = 1,
+            durationMs = 0L,
+            folderPath = "",
+            codec = ext.uppercase(Locale.US).ifBlank { "AUDIO" },
+            container = ext.uppercase(Locale.US).ifBlank { "AUDIO" },
+            sampleRateHz = 48000,
+            bitDepth = 16,
+            channelCount = 2,
+            bitrateKbps = 0,
+            isDolbyAtmos = ext == "ec3",
+            isDolbyAc4 = ext == "ac4",
+            isDsd = ext == "dsf" || ext == "dff",
+            isLossless = ext in setOf("flac", "alac", "wav", "aiff", "dsf", "dff", "wv", "ape"),
+        )
+    }
+
+    private fun resolveDocumentDisplayName(ctx: Context, uri: Uri): String? {
+        return runCatching {
+            ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+            }
+        }.getOrNull()
     }
 
     fun updateXrPreset(p: XrPreset) { _xrPreset.value = p }

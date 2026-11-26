@@ -2,6 +2,9 @@ package com.lumaxr.player.video
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.Handler
+import android.os.HandlerThread
+import android.view.PixelCopy
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -18,14 +21,19 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
 
 data class MpvTelemetry(
     val positionSec: Double = 0.0,
     val durationSec: Double = 0.0,
     val paused: Boolean = false,
+    val speed: Double = 1.0,
     val videoCodec: String = "",
     val hwdecCurrent: String = "",
     val delayedFrames: Long = 0L,
@@ -44,7 +52,7 @@ class MpvPlaceboEngine(
     private val onVulkanInitFailed: () -> Unit,
     private val onFrameMetered: (FrameLuminanceMetrics) -> Unit,
     private val onAmbientFrameSampled: (Bitmap) -> Unit = {},
-) : MPV.EventObserver, SurfaceHolder.Callback {
+) : MPV.EventObserver, MPV.LogObserver, SurfaceHolder.Callback {
 
     private val configDir = File(context.filesDir, "mpv_config").apply { mkdirs() }
     private val cacheDir = File(context.cacheDir, "mpv_shader_cache").apply { mkdirs() }
@@ -54,15 +62,26 @@ class MpvPlaceboEngine(
     private var attachedSurfaceView: SurfaceView? = null
     private var meteringJob: Job? = null
     private var currentPlan: MpvConfigPlan? = null
-    private var abLoopA: Double? = null
-    private var abLoopB: Double? = null
+    private var pendingLoadSource: String? = null
+    private var hasAttachedSurface = false
     private var fileLoadedSuccessfully = false
+    private val vulkanFallbackTriggered = AtomicBoolean(false)
+
+    @Volatile
+    private var currentSubtitlesVisible = false
+
+    @Volatile
+    private var isDestroyed = false
+
+    private var pixelCopyThread: HandlerThread? = null
+    private var pixelCopyHandler: Handler? = null
+    private var reusableMeteringBitmap: Bitmap? = null
 
     private val _telemetry = MutableStateFlow(MpvTelemetry())
     val telemetry: StateFlow<MpvTelemetry> = _telemetry.asStateFlow()
 
-    @Volatile
-    private var isDestroyed = false
+    private val _tracks = MutableStateFlow<List<MpvTrackInfo>>(emptyList())
+    val tracks: StateFlow<List<MpvTrackInfo>> = _tracks.asStateFlow()
 
     fun prepareShadersToConfigDir() {
         val shadersOut = File(configDir, "shaders").apply { mkdirs() }
@@ -79,48 +98,64 @@ class MpvPlaceboEngine(
         destroy()
         isDestroyed = false
         fileLoadedSuccessfully = false
-        abLoopA = null
-        abLoopB = null
+        hasAttachedSurface = false
+        vulkanFallbackTriggered.set(false)
+        currentSubtitlesVisible = false
         _telemetry.value = MpvTelemetry()
+        _tracks.value = emptyList()
         currentPlan = plan
         prepareShadersToConfigDir()
 
-        val instance = MPV(context, configDir.absolutePath, cacheDir.absolutePath)
+        val resolvedUri = MpvUriResolver.resolveForMpv(context, uri)
+        if (resolvedUri.isBlank()) return
+
+        // MPV(context, configDir, cacheDir) init{} already invokes nativeCreate(), nativeInit(), initSession().
+        val instance = try {
+            MPV(context, configDir.absolutePath, cacheDir.absolutePath)
+        } catch (_: Throwable) {
+            if (plan.gpuApi == "vulkan") triggerVulkanFallbackOnce()
+            return
+        }
+
         try {
-            instance.nativeCreate(context)
-            applyPreInitOptions(instance, plan)
-            instance.nativeInit()
-            instance.initSession()
+            // Gate VO creation on Surface readiness (matches mpvKt MediaPlaybackService pattern)
+            instance.setOptionString("force-window", "no")
+            applyPlaybackOptions(instance, plan)
+            instance.setOptionString("vo", "null")
+            instance.addLogObserver(this)
             instance.addObserver(this)
             observeCoreProperties(instance)
         } catch (_: Throwable) {
-            runCatching { instance.nativeDestroy(); instance.close() }
-            if (plan.gpuApi == "vulkan") onVulkanInitFailed()
+            runCatching {
+                instance.removeLogObserver(this)
+                instance.removeObserver(this)
+                instance.close()
+            }
+            if (plan.gpuApi == "vulkan") triggerVulkanFallbackOnce()
             return
         }
 
         synchronized(lock) {
             mpv = instance
             attachedSurfaceView = surfaceView
+            pendingLoadSource = resolvedUri
         }
 
         surfaceView.holder.addCallback(this)
-        val surface = surfaceView.holder.surface
-        if (surface != null && surface.isValid) {
-            instance.attachSurface(surface)
-            val w = surfaceView.width
-            val h = surfaceView.height
-            if (w > 0 && h > 0) {
-                instance.setPropertyString("android-surface-size", "${w}x$h")
-            }
+        val holderSurface = surfaceView.holder.surface
+        if (holderSurface != null && holderSurface.isValid) {
+            attachSurfaceLocked(
+                surface = holderSurface,
+                width = surfaceView.width,
+                height = surfaceView.height,
+            )
         }
 
-        instance.command("loadfile", uri)
         startMeteringLoop()
     }
 
-    private fun applyPreInitOptions(instance: MPV, plan: MpvConfigPlan) {
-        instance.setOptionString("vo", plan.vo)
+    private fun applyPlaybackOptions(instance: MPV, plan: MpvConfigPlan) {
+        instance.setOptionString("profile", "fast")
         instance.setOptionString("gpu-api", plan.gpuApi)
         instance.setOptionString("gpu-context", plan.gpuContext)
         instance.setOptionString("gpu-shader-cache", "yes")
@@ -136,10 +171,12 @@ class MpvPlaceboEngine(
         instance.setOptionString("gamut-mapping-mode", "perceptual")
         instance.setOptionString("dither-depth", "8")
         instance.setOptionString("dither", "fruit")
+        instance.setOptionString("ao", "audiotrack,opensles")
 
-        instance.setOptionString("demuxer-max-bytes", "150MiB")
+        instance.setOptionString("demuxer-max-bytes", "96MiB")
         instance.setOptionString("demuxer-readahead-secs", "20")
         instance.setOptionString("cache", "yes")
+        instance.setOptionString("msg-level", "all=warn,vo=v")
 
         instance.setOptionString("tone-mapping", plan.toneMapping)
         instance.setOptionString("hdr-compute-peak", if (plan.hdrComputePeak) "yes" else "no")
@@ -165,7 +202,7 @@ class MpvPlaceboEngine(
         instance.setOptionString("sub-auto", "fuzzy")
         instance.setOptionString("keep-open", "yes")
         if (plan.stripDolbyVisionFallback) {
-            instance.setOptionString("vf", "format:dolbyvision=no")
+            instance.setOptionString("vf", "format=dolbyvision=no")
         }
 
         val shaders = mutableListOf<String>()
@@ -174,10 +211,7 @@ class MpvPlaceboEngine(
         }
         shaders += File(configDir, "shaders/xr_lcd_master.glsl").absolutePath
         instance.setOptionString("glsl-shaders", shaders.joinToString(":"))
-        instance.setOptionString(
-            "glsl-shader-opts",
-            "hdr_toys_pipeline/u_tm_mode=${plan.hdrToysMapper.id},hdr_toys_pipeline/u_dst_peak=${plan.targetPeakNits}.0",
-        )
+        instance.setOptionString("glsl-shader-opts", MpvShaderOptsFormatter.formatInitialOpts(plan))
     }
 
     private fun observeCoreProperties(instance: MPV) {
@@ -185,9 +219,11 @@ class MpvPlaceboEngine(
         val flag = MPV.mpvFormat.MPV_FORMAT_FLAG
         val str = MPV.mpvFormat.MPV_FORMAT_STRING
         val i64 = MPV.mpvFormat.MPV_FORMAT_INT64
+        val node = MPV.mpvFormat.MPV_FORMAT_NODE
         instance.observeProperty("time-pos", dbl)
         instance.observeProperty("duration", dbl)
         instance.observeProperty("pause", flag)
+        instance.observeProperty("speed", dbl)
         instance.observeProperty("video-codec", str)
         instance.observeProperty("hwdec-current", str)
         instance.observeProperty("vo-delayed-frame-count", i64)
@@ -197,6 +233,28 @@ class MpvPlaceboEngine(
         instance.observeProperty("container-fps", dbl)
         instance.observeProperty("video-params/colormatrix", str)
         instance.observeProperty("video-params/gamma", str)
+        instance.observeProperty("sub-text", str)
+        instance.observeProperty("track-list", node)
+    }
+
+    private fun attachSurfaceLocked(surface: Surface, width: Int, height: Int) {
+        synchronized(lock) {
+            val m = mpv ?: return
+            if (!m.isInitialized || isDestroyed) return
+            hasAttachedSurface = true
+            m.attachSurface(surface)
+            m.setOptionString("force-window", "yes")
+            m.setPropertyString("vo", currentPlan?.vo ?: "gpu-next")
+            if (width > 0 && height > 0) {
+                m.setPropertyString("android-surface-size", "${width}x$height")
+            }
+            val pending = pendingLoadSource
+            if (!pending.isNullOrBlank()) {
+                pendingLoadSource = null
+                m.setPropertyBoolean("pause", false)
+                m.command("loadfile", pending)
+            }
+        }
     }
 
     fun applyLiveBacklightAndWipeUniforms(
@@ -209,22 +267,14 @@ class MpvPlaceboEngine(
         synchronized(lock) {
             val m = mpv ?: return
             if (!m.isInitialized) return
-            val plan = currentPlan
-            val isPqOrHlgOut = plan?.targetTrc == "pq"
-            val opts = buildString {
-                append(String.format(Locale.US, "xr_lcd_master/u_inv_gain=%.4f,", backlight.inverseShaderGain))
-                append(String.format(Locale.US, "xr_lcd_master/u_local_contrast=%.4f,", backlight.localContrastStrength))
-                append("xr_lcd_master/u_bilateral_radius=$bilateralRadius,")
-                append(String.format(Locale.US, "xr_lcd_master/u_letterbox_top=%.4f,", aspectState.letterboxTopNorm))
-                append(String.format(Locale.US, "xr_lcd_master/u_letterbox_bottom=%.4f,", aspectState.letterboxBottomNorm))
-                append(String.format(Locale.US, "xr_lcd_master/u_split_wipe=%.4f,", splitWipe))
-                append("xr_lcd_master/u_bypass_original=${if (bypassOriginal) "1.0" else "0.0"},")
-                append("xr_lcd_master/u_is_linear_bypass=${if (isPqOrHlgOut) "1.0" else "0.0"}")
-                if (plan != null && plan.hdrToysMapper != HdrToysToneMapper.OFF) {
-                    append(",hdr_toys_pipeline/u_tm_mode=${plan.hdrToysMapper.id}")
-                    append(",hdr_toys_pipeline/u_dst_peak=${plan.targetPeakNits}.0")
-                }
-            }
+            val opts = MpvShaderOptsFormatter.formatLiveOpts(
+                backlight = backlight,
+                splitWipe = splitWipe,
+                bypassOriginal = bypassOriginal,
+                bilateralRadius = bilateralRadius,
+                aspectState = aspectState,
+                plan = currentPlan,
+            )
             runCatching { m.setPropertyString("glsl-shader-opts", opts) }
         }
     }
@@ -233,6 +283,7 @@ class MpvPlaceboEngine(
         synchronized(lock) {
             val m = mpv ?: return
             if (!m.isInitialized) return
+            val shadersChanged = currentPlan?.hdrToysMapper != plan.hdrToysMapper
             currentPlan = plan
             runCatching {
                 m.setPropertyString("target-peak", plan.targetPeakNits.toString())
@@ -245,6 +296,14 @@ class MpvPlaceboEngine(
                 m.setPropertyString("deband", if (plan.debandEnabled) "yes" else "no")
                 m.setPropertyString("sharpen", String.format(Locale.US, "%.2f", plan.sharpen))
                 m.setPropertyString("sub-hdr-peak", plan.subHdrPeakNits.toString())
+                if (shadersChanged) {
+                    val shaders = mutableListOf<String>()
+                    if (plan.hdrToysMapper != HdrToysToneMapper.OFF) {
+                        shaders += File(configDir, "shaders/hdr_toys_pipeline.glsl").absolutePath
+                    }
+                    shaders += File(configDir, "shaders/xr_lcd_master.glsl").absolutePath
+                    m.setPropertyString("glsl-shaders", shaders.joinToString(":"))
+                }
             }
         }
     }
@@ -274,7 +333,11 @@ class MpvPlaceboEngine(
     }
 
     fun setSpeed(speed: Double) {
-        synchronized(lock) { mpv?.takeIf { it.isInitialized }?.setPropertyDouble("speed", speed.coerceIn(0.25, 4.0)) }
+        synchronized(lock) {
+            val clamped = speed.coerceIn(0.25, 4.0)
+            mpv?.takeIf { it.isInitialized }?.setPropertyDouble("speed", clamped)
+            _telemetry.value = _telemetry.value.copy(speed = clamped)
+        }
     }
 
     fun setSubPos(pos: Int) {
@@ -286,17 +349,29 @@ class MpvPlaceboEngine(
     }
 
     fun selectTrack(type: String, id: Int) {
-        synchronized(lock) { mpv?.takeIf { it.isInitialized }?.setPropertyInt(type, id) }
+        synchronized(lock) {
+            val m = mpv?.takeIf { it.isInitialized } ?: return
+            if (id <= 0) {
+                m.setPropertyString(type, "no")
+            } else {
+                m.setPropertyInt(type, id)
+            }
+            refreshTrackListLocked(m)
+        }
     }
 
     fun addExternalSubtitle(pathOrUrl: String) {
-        synchronized(lock) { mpv?.takeIf { it.isInitialized }?.command("sub-add", pathOrUrl, "select") }
+        val resolved = MpvUriResolver.resolveForMpv(context, pathOrUrl)
+        if (resolved.isBlank()) return
+        synchronized(lock) {
+            val m = mpv?.takeIf { it.isInitialized } ?: return
+            m.command("sub-add", resolved, "select")
+            refreshTrackListLocked(m)
+        }
     }
 
     fun setAbLoop(aSec: Double?, bSec: Double?) {
         synchronized(lock) {
-            abLoopA = aSec
-            abLoopB = bSec
             val m = mpv?.takeIf { it.isInitialized } ?: return
             m.setPropertyString("ab-loop-a", aSec?.toString() ?: "no")
             m.setPropertyString("ab-loop-b", bSec?.toString() ?: "no")
@@ -318,7 +393,50 @@ class MpvPlaceboEngine(
         synchronized(lock) {
             val m = mpv ?: return
             if (!m.isInitialized) return
-            m.setPropertyString("vf", if (strip) "format:dolbyvision=no" else "")
+            runCatching { m.setPropertyString("vf", if (strip) "format=dolbyvision=no" else "") }
+        }
+    }
+
+    private fun refreshTrackListLocked(m: MPV) {
+        runCatching { m.getPropertyNode("track-list") }.getOrNull()?.let { node ->
+            _tracks.value = MpvShaderOptsFormatter.parseTrackList(node)
+        }
+    }
+
+    private fun ensurePixelCopyHandler(): Handler {
+        val existing = pixelCopyHandler
+        if (existing != null) return existing
+        val thread = HandlerThread("LumaXR-PixelCopy").apply { start() }
+        val handler = Handler(thread.looper)
+        pixelCopyThread = thread
+        pixelCopyHandler = handler
+        return handler
+    }
+
+    private suspend fun captureSurfaceSampleAsync(surfaceView: SurfaceView): Bitmap? {
+        if (isDestroyed || !hasAttachedSurface) return null
+        val surface = runCatching { surfaceView.holder.surface }.getOrNull() ?: return null
+        if (!surface.isValid || surfaceView.width <= 0 || surfaceView.height <= 0) return null
+
+        val bmp = reusableMeteringBitmap?.takeIf { !it.isRecycled && it.width == 64 && it.height == 36 }
+            ?: Bitmap.createBitmap(64, 36, Bitmap.Config.ARGB_8888).also { reusableMeteringBitmap = it }
+        val handler = ensurePixelCopyHandler()
+
+        return suspendCancellableCoroutine { cont ->
+            try {
+                PixelCopy.request(
+                    surfaceView,
+                    bmp,
+                    { result ->
+                        if (cont.isActive) {
+                            cont.resume(if (result == PixelCopy.SUCCESS) bmp else null)
+                        }
+                    },
+                    handler,
+                )
+            } catch (_: Throwable) {
+                if (cont.isActive) cont.resume(null)
+            }
         }
     }
 
@@ -326,22 +444,21 @@ class MpvPlaceboEngine(
         meteringJob?.cancel()
         meteringJob = scope.launch(Dispatchers.Default) {
             while (isActive && !isDestroyed) {
-                var thumb: Bitmap? = null
-                var subVisible = false
-                synchronized(lock) {
-                    val m = mpv
-                    if (m != null && m.isInitialized && !_telemetry.value.paused) {
-                        thumb = runCatching { m.grabThumbnail(64) }.getOrNull()
-                        subVisible = runCatching { m.getPropertyString("sub-text") }.getOrNull()?.isNotBlank() == true
+                val sv = synchronized(lock) { attachedSurfaceView }
+                if (sv != null && !_telemetry.value.paused && hasAttachedSurface && fileLoadedSuccessfully) {
+                    val bmp = withContext(Dispatchers.Main) {
+                        captureSurfaceSampleAsync(sv)
+                    }
+                    if (bmp != null && !bmp.isRecycled) {
+                        val metrics = analyzeThumbnailLuma(bmp, currentSubtitlesVisible)
+                        onFrameMetered(metrics)
+                        val copyForAmbient = bmp.copy(Bitmap.Config.ARGB_8888, false)
+                        if (copyForAmbient != null) {
+                            onAmbientFrameSampled(copyForAmbient)
+                        }
                     }
                 }
-                val bmp = thumb
-                if (bmp != null) {
-                    val metrics = analyzeThumbnailLuma(bmp, subVisible)
-                    onFrameMetered(metrics)
-                    onAmbientFrameSampled(bmp)
-                }
-                delay(40L)
+                delay(120L)
             }
         }
     }
@@ -384,6 +501,21 @@ class MpvPlaceboEngine(
         )
     }
 
+    private fun triggerVulkanFallbackOnce() {
+        if (!isDestroyed && currentPlan?.gpuApi == "vulkan" && vulkanFallbackTriggered.compareAndSet(false, true)) {
+            onVulkanInitFailed()
+        }
+    }
+
+    override fun logMessage(prefix: String, level: Int, text: String) {
+        if (currentPlan?.gpuApi == "vulkan" &&
+            !fileLoadedSuccessfully &&
+            MpvShaderOptsFormatter.shouldTriggerVulkanFallback(level, prefix, text)
+        ) {
+            triggerVulkanFallbackOnce()
+        }
+    }
+
     override fun eventProperty(property: String) {}
 
     override fun eventProperty(property: String, value: Long) {
@@ -402,6 +534,10 @@ class MpvPlaceboEngine(
     }
 
     override fun eventProperty(property: String, value: String) {
+        if (property == "sub-text") {
+            currentSubtitlesVisible = value.isNotBlank()
+            return
+        }
         val cur = _telemetry.value
         _telemetry.value = when (property) {
             "video-codec" -> cur.copy(videoCodec = value)
@@ -418,39 +554,66 @@ class MpvPlaceboEngine(
             "time-pos" -> cur.copy(positionSec = value)
             "duration" -> cur.copy(durationSec = value)
             "container-fps" -> cur.copy(fps = value)
+            "speed" -> cur.copy(speed = value)
             else -> cur
         }
     }
 
-    override fun eventProperty(property: String, value: MPVNode) {}
+    override fun eventProperty(property: String, value: MPVNode) {
+        if (property == "track-list") {
+            _tracks.value = MpvShaderOptsFormatter.parseTrackList(value)
+        }
+    }
 
     override fun event(eventId: Int, data: MPVNode) {
-        if (eventId == MPV.mpvEvent.MPV_EVENT_FILE_LOADED) {
-            fileLoadedSuccessfully = true
-        } else if (eventId == MPV.mpvEvent.MPV_EVENT_SHUTDOWN &&
-            currentPlan?.gpuApi == "vulkan" &&
-            !fileLoadedSuccessfully &&
-            !isDestroyed
-        ) {
-            onVulkanInitFailed()
+        when (eventId) {
+            MPV.mpvEvent.MPV_EVENT_FILE_LOADED -> {
+                fileLoadedSuccessfully = true
+                synchronized(lock) {
+                    mpv?.takeIf { it.isInitialized }?.let { refreshTrackListLocked(it) }
+                }
+            }
+            MPV.mpvEvent.MPV_EVENT_END_FILE -> {
+                val reason = runCatching { data["reason"]?.asString() }.getOrNull()
+                if (!fileLoadedSuccessfully && reason == "error") {
+                    triggerVulkanFallbackOnce()
+                }
+            }
+            MPV.mpvEvent.MPV_EVENT_SHUTDOWN -> {
+                if (!fileLoadedSuccessfully) {
+                    triggerVulkanFallbackOnce()
+                }
+            }
         }
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         val surface: Surface = holder.surface
         if (surface.isValid) {
-            synchronized(lock) { mpv?.attachSurface(surface) }
+            val view = attachedSurfaceView
+            attachSurfaceLocked(surface, view?.width ?: 0, view?.height ?: 0)
         }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         if (width > 0 && height > 0) {
-            synchronized(lock) { mpv?.setPropertyString("android-surface-size", "${width}x$height") }
+            synchronized(lock) {
+                mpv?.takeIf { it.isInitialized && hasAttachedSurface }
+                    ?.setPropertyString("android-surface-size", "${width}x$height")
+            }
         }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        synchronized(lock) { mpv?.detachSurface() }
+        synchronized(lock) {
+            val m = mpv
+            if (m != null && m.isInitialized && hasAttachedSurface) {
+                hasAttachedSurface = false
+                runCatching { m.setPropertyString("vo", "null") }
+                runCatching { m.setPropertyString("force-window", "no") }
+                runCatching { m.detachSurface() }
+            }
+        }
     }
 
     fun destroy() {
@@ -458,18 +621,29 @@ class MpvPlaceboEngine(
         meteringJob?.cancel()
         meteringJob = null
         synchronized(lock) {
+            hasAttachedSurface = false
+            pendingLoadSource = null
             attachedSurfaceView?.holder?.removeCallback(this)
             attachedSurfaceView = null
             mpv?.let { instance ->
                 runCatching {
+                    instance.removeLogObserver(this)
                     instance.removeObserver(this)
-                    instance.detachSurface()
-                    instance.destroySession()
-                    instance.nativeDestroy()
+                    if (instance.isInitialized) {
+                        instance.setPropertyString("vo", "null")
+                        instance.setPropertyString("force-window", "no")
+                        instance.detachSurface()
+                    }
+                    // MPV.close() invokes nativeDestroy() and destroySession() cleanly.
                     instance.close()
                 }
             }
             mpv = null
+            pixelCopyThread?.quitSafely()
+            pixelCopyThread = null
+            pixelCopyHandler = null
+            reusableMeteringBitmap?.let { if (!it.isRecycled) it.recycle() }
+            reusableMeteringBitmap = null
         }
     }
 }

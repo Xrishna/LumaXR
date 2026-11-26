@@ -72,6 +72,10 @@ class DualEngineCoordinator(
 
     private var currentPreset: XrPreset = XrPreset.CINEMA_MASTERING_XR
     private var currentPolicy: RefreshRatePolicy = RefreshRatePolicy.AUTO_CINEMA_120HZ
+    private var currentEnginePreference: EngineSwitchPreference = EngineSwitchPreference.AUTO
+    private var currentExperimentalHbm: Boolean = false
+    private var currentHdrToysMapper: HdrToysToneMapper = HdrToysToneMapper.OFF
+    private var currentSubPeakNits: Int = 140
     private var currentAspectState: SmartAspectState = SmartAspectState()
     private var currentPlan: MpvConfigPlan? = null
     private var currentUri: String? = null
@@ -89,7 +93,16 @@ class DualEngineCoordinator(
             val view = currentSurfaceView?.get()
             if (uri != null && view != null) {
                 scope.launch(Dispatchers.Main) {
-                    startPlayback(view, uri, currentPreset, currentPolicy, EngineSwitchPreference.AUTO)
+                    startPlayback(
+                        surfaceView = view,
+                        uri = uri,
+                        preset = currentPreset,
+                        refreshPolicy = currentPolicy,
+                        enginePreference = currentEnginePreference,
+                        experimentalHbm = currentExperimentalHbm,
+                        hdrToysMapper = currentHdrToysMapper,
+                        subtitlePeakNits = currentSubPeakNits,
+                    )
                 }
             }
         },
@@ -130,6 +143,10 @@ class DualEngineCoordinator(
         currentSurfaceView = WeakReference(surfaceView)
         currentPreset = preset
         currentPolicy = refreshPolicy
+        currentEnginePreference = enginePreference
+        currentExperimentalHbm = experimentalHbm
+        currentHdrToysMapper = hdrToysMapper
+        currentSubPeakNits = subtitlePeakNits
         thermalGovernor.start()
 
         val media = prober.probe(uri)
@@ -399,6 +416,12 @@ class DualEngineCoordinator(
             val cur = media3Engine.telemetry.value.positionMs
             media3Engine.seekToMs(cur + (deltaSeconds * 1000).toLong())
         }
+    }
+
+    fun isUsingVulkan(): Boolean = useVulkan
+
+    fun resetVulkanFallbackPreference() {
+        useVulkan = true
     }
 
     fun stopAndRestoreDisplay() {

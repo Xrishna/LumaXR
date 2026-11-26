@@ -1,5 +1,7 @@
 package com.lumaxr.player.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -16,13 +18,16 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -35,6 +40,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.lumaxr.player.data.AudioTrackEntity
 import kotlinx.serialization.json.Json
 import java.util.Locale
@@ -46,11 +52,21 @@ fun MusicLibraryScreen(
     onPlayTracks: (List<AudioTrackEntity>, Int) -> Unit,
     onOpenNowPlaying: () -> Unit,
 ) {
-    val allTracks by viewModel.audioTracks.collectAsState()
-    val hiResDolby by viewModel.hiResDolbyTracks.collectAsState()
-    val playlists by viewModel.playlists.collectAsState()
-    val listeningEvents by viewModel.listeningEvents.collectAsState()
-    val totalMs by viewModel.totalListenedMs.collectAsState()
+    val allTracks by viewModel.audioTracks.collectAsStateWithLifecycle()
+    val hiResDolby by viewModel.hiResDolbyTracks.collectAsStateWithLifecycle()
+    val playlists by viewModel.playlists.collectAsStateWithLifecycle()
+    val listeningEvents by viewModel.listeningEvents.collectAsStateWithLifecycle()
+    val totalMs by viewModel.totalListenedMs.collectAsStateWithLifecycle()
+
+    val audioPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            val track = viewModel.buildAudioTrackFromDocumentUri(uri)
+            onPlayTracks(listOf(track), 0)
+            onOpenNowPlaying()
+        }
+    }
 
     val hiResListState = rememberLazyListState()
     val albumsGroups = remember(allTracks) { allTracks.groupBy { it.album } }
@@ -67,18 +83,29 @@ fun MusicLibraryScreen(
             .background(Color.Black)
             .padding(top = 82.dp, bottom = 148.dp),
     ) {
-        ScrollableTabRow(
-            selectedTabIndex = selectedTab,
-            containerColor = Color(0xFF0B101B),
-            contentColor = Color(0xFF38BDF8),
-            edgePadding = 16.dp,
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF0B101B)),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            tabs.forEachIndexed { idx, label ->
-                Tab(
-                    selected = selectedTab == idx,
-                    onClick = { selectedTab = idx },
-                    text = { Text(label) },
-                )
+            ScrollableTabRow(
+                selectedTabIndex = selectedTab,
+                containerColor = Color.Transparent,
+                contentColor = Color(0xFF38BDF8),
+                edgePadding = 16.dp,
+                modifier = Modifier.weight(1f),
+            ) {
+                tabs.forEachIndexed { idx, label ->
+                    Tab(
+                        selected = selectedTab == idx,
+                        onClick = { selectedTab = idx },
+                        text = { Text(label) },
+                    )
+                }
+            }
+            IconButton(onClick = { audioPicker.launch(arrayOf("audio/*", "*/*")) }) {
+                Icon(Icons.Default.FolderOpen, contentDescription = "Open Audio File", tint = Color(0xFF38BDF8))
             }
         }
 
@@ -191,7 +218,7 @@ private fun GroupedAudioPane(
     onPlayGroup: (List<AudioTrackEntity>) -> Unit,
 ) {
     LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        itemsIndexed(groups.entries.toList()) { _, entry ->
+        itemsIndexed(groups.entries.toList(), key = { idx, e -> "${idx}_${e.key}" }) { _, entry ->
             Surface(
                 color = Color(0xFF111827),
                 shape = RoundedCornerShape(14.dp),

@@ -112,7 +112,12 @@ class MediaFormatProber(private val context: Context) {
 
         val dvBox = parseDvcCOrDvvC(headerBytes) ?: hasCsdDvBox
         val hasHdr10Plus = hasCsdHdr10Plus || containsHdr10PlusBytes(headerBytes)
-        val fileName = uri.lastPathSegment?.substringAfterLast('/') ?: uriString.substringAfterLast('/')
+        val fileName = resolveDisplayName(uri) ?: uri.lastPathSegment?.substringAfterLast('/') ?: uriString.substringAfterLast('/')
+        val resolvedContainer = if (container == "STREAM" && fileName.contains('.')) {
+            detectContainer(fileName)
+        } else {
+            container
+        }
         val hdrFormat = classifyHdrFormat(
             dvProfile = dvBox?.first,
             dvCompatibilityId = dvBox?.second,
@@ -126,7 +131,7 @@ class MediaFormatProber(private val context: Context) {
         ProbedMediaInfo(
             uri = uriString,
             title = fileName,
-            container = container,
+            container = resolvedContainer,
             hdrFormat = hdrFormat,
             width = width,
             height = height,
@@ -249,6 +254,22 @@ class MediaFormatProber(private val context: Context) {
         } catch (_: Throwable) {
             ByteArray(0)
         }
+    }
+
+    private fun resolveDisplayName(uri: Uri): String? {
+        if (uri.scheme != "content") return null
+        return runCatching {
+            context.contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null,
+            )?.use { c ->
+                val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+            }
+        }.getOrNull()
     }
 
     private fun detectContainer(uri: String): String {

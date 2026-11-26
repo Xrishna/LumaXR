@@ -85,24 +85,25 @@ class MusicScannerRepository(
                 val colAdded = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
 
                 while (cursor.moveToNext()) {
+                    val id = cursor.getLong(colId)
+                    val contentUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
                     val path = cursor.getString(colData).orEmpty()
-                    val file = File(path)
-                    val parentDir = file.parentFile
+                    val file = if (path.isNotBlank()) File(path) else null
+                    val parentDir = file?.parentFile
                     val animCover = findAnimatedCover(parentDir)
                     val albumArtUri = ContentUris.withAppendedId(
                         Uri.parse("content://media/external/audio/albumart"),
                         cursor.getLong(colAlbumId),
                     ).toString()
                     val mime = cursor.getString(colMime).orEmpty()
-                    val ext = file.extension.lowercase(Locale.ROOT)
-                    val tech = probeAudioFormatQuick(path, mime)
+                    val ext = file?.extension?.lowercase(Locale.ROOT).orEmpty()
+                    val tech = probeAudioFormatQuick(path, mime, contentUri)
 
-                    val trackUri = path.ifBlank {
-                        ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, cursor.getLong(colId)).toString()
-                    }
+                    val trackUri = if (path.isNotBlank() && file?.canRead() == true) path else contentUri.toString()
+                    val fallbackTitle = file?.nameWithoutExtension ?: "Track $id"
                     discovered += AudioTrackEntity(
                         uri = trackUri,
-                        title = cursor.getString(colTitle) ?: file.nameWithoutExtension,
+                        title = cursor.getString(colTitle)?.takeIf { it.isNotBlank() } ?: fallbackTitle,
                         artist = cursor.getString(colArtist) ?: "Unknown Artist",
                         album = cursor.getString(colAlbum) ?: "Unknown Album",
                         albumArtist = cursor.getString(colArtist) ?: "Unknown Artist",
@@ -245,15 +246,19 @@ class MusicScannerRepository(
         val durationMs: Long = 0L,
     )
 
-    private fun probeAudioFormatQuick(path: String, fallbackMime: String): QuickAudioTech {
-        if (path.isBlank()) return QuickAudioTech(fallbackMime.substringAfter('/'), 48000, 16, 2, false, false)
-        val ext = File(path).extension.lowercase(Locale.ROOT)
+    private fun probeAudioFormatQuick(path: String, fallbackMime: String, contentUri: Uri? = null): QuickAudioTech {
+        val ext = if (path.isNotBlank()) File(path).extension.lowercase(Locale.ROOT) else fallbackMime.substringAfter('/')
         if (ext == "dsf" || ext == "dff") {
             return QuickAudioTech("DSD", 2822400, 1, 2, false, false)
         }
         val ex = MediaExtractor()
         return try {
-            ex.setDataSource(path)
+            val readableFile = path.isNotBlank() && File(path).canRead()
+            when {
+                readableFile -> ex.setDataSource(path)
+                contentUri != null -> ex.setDataSource(appContext, contentUri, null)
+                else -> return QuickAudioTech(fallbackMime.substringAfter('/'), 48000, 16, 2, false, false)
+            }
             for (i in 0 until ex.trackCount) {
                 val fmt = ex.getTrackFormat(i)
                 val mime = fmt.getString(MediaFormat.KEY_MIME).orEmpty()

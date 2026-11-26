@@ -2,22 +2,22 @@
 //!HOOK LINEAR
 //!BIND HOOKED
 //!PARAM u_tm_mode
-//!TYPE int
+//!TYPE DYNAMIC int
 //!MINIMUM 0
 //!MAXIMUM 5
 0
 //!PARAM u_src_peak
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 100.0
 //!MAXIMUM 10000.0
 1000.0
 //!PARAM u_dst_peak
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 100.0
 //!MAXIMUM 600.0
 240.0
 //!PARAM u_astra_strength
-//!TYPE float
+//!TYPE DYNAMIC float
 //!MINIMUM 0.0
 //!MAXIMUM 1.0
 0.35

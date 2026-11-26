@@ -1,8 +1,6 @@
 package com.lumaxr.player.music
 
 import android.content.Context
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -16,6 +14,7 @@ import androidx.glance.appwidget.GlanceAppWidgetReceiver
 import androidx.glance.appwidget.action.ActionCallback
 import androidx.glance.appwidget.action.actionRunCallback
 import androidx.glance.appwidget.provideContent
+import androidx.glance.appwidget.updateAll
 import androidx.glance.background
 import androidx.glance.layout.Alignment
 import androidx.glance.layout.Column
@@ -39,16 +38,35 @@ class MusicGlanceWidgetReceiver : GlanceAppWidgetReceiver() {
     override val glanceAppWidget: GlanceAppWidget = MusicGlanceWidget()
 }
 
+private data class MusicWidgetSnapshot(
+    val title: String,
+    val subtitle: String,
+    val isPlaying: Boolean,
+)
+
 class MusicGlanceWidget : GlanceAppWidget() {
+
+    companion object {
+        suspend fun notifyStateChanged(context: Context) {
+            runCatching { MusicGlanceWidget().updateAll(context) }
+        }
+    }
 
     override suspend fun provideGlance(context: Context, id: GlanceId) {
         val app = context.applicationContext as? LumaXrApplication
-        val stateFlow = app?.container?.musicCoordinator?.state
+        val state = app?.container?.musicCoordinator?.state?.value
+        val track = state?.currentTrack
+        val snapshot = MusicWidgetSnapshot(
+            title = track?.title ?: "LumaXR Audiophile",
+            subtitle = if (track != null) {
+                "${track.artist} • ${track.codec.uppercase(Locale.US)}"
+            } else {
+                "Tap to play Hi-Res & Dolby"
+            },
+            isPlaying = state?.isPlaying == true,
+        )
 
         provideContent {
-            val state = stateFlow?.collectAsState()?.value
-            val track = state?.currentTrack
-
             Column(
                 modifier = GlanceModifier
                     .fillMaxSize()
@@ -58,7 +76,7 @@ class MusicGlanceWidget : GlanceAppWidget() {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = track?.title ?: "LumaXR Audiophile",
+                    text = snapshot.title,
                     style = TextStyle(
                         color = ColorProvider(Color.White),
                         fontSize = 16.sp,
@@ -68,7 +86,7 @@ class MusicGlanceWidget : GlanceAppWidget() {
                 )
                 Spacer(modifier = GlanceModifier.height(2.dp))
                 Text(
-                    text = if (track != null) "${track.artist} • ${track.codec.uppercase(Locale.US)}" else "Tap to play Hi-Res & Dolby",
+                    text = snapshot.subtitle,
                     style = TextStyle(
                         color = ColorProvider(Color(0xFF94A3B8)),
                         fontSize = 12.sp,
@@ -83,7 +101,11 @@ class MusicGlanceWidget : GlanceAppWidget() {
                 ) {
                     Text(
                         text = "⏮ Prev",
-                        style = TextStyle(color = ColorProvider(Color(0xFF7DD3FC)), fontSize = 13.sp, fontWeight = FontWeight.Medium),
+                        style = TextStyle(
+                            color = ColorProvider(Color(0xFF7DD3FC)),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                        ),
                         modifier = GlanceModifier
                             .padding(horizontal = 10.dp, vertical = 6.dp)
                             .background(Color(0xFF1E293B))
@@ -91,8 +113,12 @@ class MusicGlanceWidget : GlanceAppWidget() {
                     )
                     Spacer(modifier = GlanceModifier.width(8.dp))
                     Text(
-                        text = if (state?.isPlaying == true) "⏸ Pause" else "▶ Play",
-                        style = TextStyle(color = ColorProvider(Color.Black), fontSize = 13.sp, fontWeight = FontWeight.Bold),
+                        text = if (snapshot.isPlaying) "⏸ Pause" else "▶ Play",
+                        style = TextStyle(
+                            color = ColorProvider(Color.Black),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                        ),
                         modifier = GlanceModifier
                             .padding(horizontal = 14.dp, vertical = 6.dp)
                             .background(Color(0xFF38BDF8))
@@ -101,7 +127,11 @@ class MusicGlanceWidget : GlanceAppWidget() {
                     Spacer(modifier = GlanceModifier.width(8.dp))
                     Text(
                         text = "Next ⏭",
-                        style = TextStyle(color = ColorProvider(Color(0xFF7DD3FC)), fontSize = 13.sp, fontWeight = FontWeight.Medium),
+                        style = TextStyle(
+                            color = ColorProvider(Color(0xFF7DD3FC)),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                        ),
                         modifier = GlanceModifier
                             .padding(horizontal = 10.dp, vertical = 6.dp)
                             .background(Color(0xFF1E293B))
@@ -118,7 +148,7 @@ class GlancePlayPauseAction : ActionCallback {
         val app = context.applicationContext as? LumaXrApplication
         app?.container?.musicCoordinator?.togglePlayPause()
         delay(80L)
-        MusicGlanceWidget().update(context, glanceId)
+        MusicGlanceWidget.notifyStateChanged(context)
     }
 }
 
@@ -127,7 +157,7 @@ class GlancePrevAction : ActionCallback {
         val app = context.applicationContext as? LumaXrApplication
         app?.container?.musicCoordinator?.prevTrack()
         delay(80L)
-        MusicGlanceWidget().update(context, glanceId)
+        MusicGlanceWidget.notifyStateChanged(context)
     }
 }
 
@@ -136,6 +166,6 @@ class GlanceNextAction : ActionCallback {
         val app = context.applicationContext as? LumaXrApplication
         app?.container?.musicCoordinator?.nextTrack()
         delay(80L)
-        MusicGlanceWidget().update(context, glanceId)
+        MusicGlanceWidget.notifyStateChanged(context)
     }
 }
