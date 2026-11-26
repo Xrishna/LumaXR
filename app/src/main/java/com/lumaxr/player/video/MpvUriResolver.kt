@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import `is`.xyz.mpv.Utils
+import java.net.URI
 
 data class ResolvedMpvSource(
     val uriOrPath: String,
@@ -44,8 +45,10 @@ object MpvUriResolver {
         if (trimmed.isEmpty()) return ResolvedMpvSource("")
 
         if (trimmed.startsWith("file://", ignoreCase = true)) {
-            val path = Uri.parse(trimmed).path ?: trimmed.removePrefix("file://")
-            return ResolvedMpvSource(path, usedContentFd = false)
+            val parsedPath = runCatching { Uri.parse(trimmed)?.path }.getOrNull()
+                ?: runCatching { URI(trimmed).path }.getOrNull()
+                ?: trimmed.substring(7)
+            return ResolvedMpvSource(parsedPath, usedContentFd = false)
         }
 
         if (trimmed.startsWith("content://", ignoreCase = true)) {
